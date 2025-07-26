@@ -1,0 +1,12 @@
+Metadata-Version: 2.2
+Name: green_context_lib
+Version: 0.1.0
+Summary: CUDA Green Context Python Library for FlashInfer
+Author: Your Name
+Requires-Python: >=3.7
+Requires-Dist: torch
+Requires-Dist: pybind11>=2.6.0
+Dynamic: author
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
