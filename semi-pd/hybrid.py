@@ -9,9 +9,8 @@ num_kv_heads = 8   # GQA: KV heads
 num_qo_heads = 64  # GQA: Query heads
 head_dim = 128
 
-def setup_prefill_data(batch_size=64, kv_len=4096, qo_len=4096):
-    """设置 prefill 测试数据"""
-
+def setup_paged_data(batch_size=64, kv_len=4096, qo_len=4096):
+    """设置 Paged KV Cache 测试数据"""
     # Query: NHD layout
     total_q_len = batch_size * qo_len
     q = torch.randn(total_q_len, num_qo_heads, head_dim).half().to("cuda:0")
@@ -40,12 +39,8 @@ def setup_prefill_data(batch_size=64, kv_len=4096, qo_len=4096):
 
     return q, paged_kv_cache, paged_kv_indices, paged_kv_indptr, paged_kv_last_page_len, qo_indptr
 
-def setup_decode_data(batch_size=64, kv_len=4096, qo_len=1):
-    """设置 decode 测试数据"""
-    return setup_prefill_data(batch_size, kv_len, qo_len)
-
 def prefill_worker(wrapper, q, kv_cache, runs, ready_event):
-    """在默认context下运行prefill的线程函数"""
+    """在默认context下运行prefill的线程函数 (Paged)"""
     print("Prefill worker: 等待开始...")
     ready_event.wait() # 等待主线程信号
     print("Prefill worker: 开始执行")
@@ -58,6 +53,10 @@ def decode_worker(wrapper, q, kv_cache, runs, sm_count, ready_event):
     if not green_context.create_green_context(sm_count=sm_count):
         print(f"Decode worker: 无法创建Green Context")
         return
+    if not green_context.switch_to_green_context():
+        print(f"Decode worker: 无法切换到Green Context")
+        green_context.destroy_green_context()
+        return
     try:
         ready_event.wait() # 等待主线程信号
         print("Decode worker: 开始执行 (在Green Context中)")
@@ -67,16 +66,16 @@ def decode_worker(wrapper, q, kv_cache, runs, sm_count, ready_event):
         green_context.destroy_green_context()
         print("Decode worker: 已销毁Green Context")
 
-def sequential_worker(wrapper, q, kv_cache, runs, kernel_name):
+def sequential_worker(wrapper, data_args, runs, kernel_name, run_multiplier=1):
     """顺序执行指定kernel的函数（批量提交版本）"""
     print(f"\n--- 提交 {kernel_name} 任务 ---")
     
-    total_runs = runs
+    total_runs = runs * run_multiplier
     # 批量提交所有任务
     for i in range(total_runs):
         if (i + 1) % 100 == 0:
             print(f"  {kernel_name}: 提交第 {i+1}/{total_runs} 个任务...")
-        wrapper.run(q, kv_cache)
+        wrapper.run(*data_args)
     
     print(f"  {kernel_name}: {total_runs} 个任务提交完成。")
 
@@ -91,11 +90,8 @@ def main():
     print(f"=== FlashInfer {args.mode.capitalize()} 测试 ===")
     
     # 1. 设置数据
-    prefill_data = setup_prefill_data(batch_size=args.batch_size, qo_len=4096)
-    decode_data = setup_decode_data(batch_size=args.batch_size, qo_len=1)
-    
-    prefill_q, prefill_kv, prefill_indices, prefill_indptr, prefill_last_len, prefill_qo_indptr = prefill_data
-    decode_q, decode_kv, decode_indices, decode_indptr, decode_last_len, decode_qo_indptr = decode_data
+    prefill_q, prefill_kv_paged, prefill_indices, prefill_indptr, prefill_last_len, prefill_qo_indptr = setup_paged_data(batch_size=args.batch_size, qo_len=4096)
+    decode_q, decode_kv_paged, decode_indices, decode_indptr, decode_last_len, decode_qo_indptr = setup_paged_data(batch_size=args.batch_size, qo_len=1)
     
     # 2. 在主线程(默认context)中创建和plan wrappers
     prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0"), "NHD")
@@ -113,14 +109,14 @@ def main():
         # 3. 预热
         print("\n预热阶段 (并发)...")
         for _ in range(2):
-            prefill_wrapper.run(prefill_q, prefill_kv)
-            decode_wrapper.run(decode_q, decode_kv)
+            prefill_wrapper.run(prefill_q, prefill_kv_paged)
+            decode_wrapper.run(decode_q, decode_kv_paged)
         torch.cuda.synchronize()
 
         # 4. 创建线程
         ready_event = threading.Event()
-        prefill_thread = threading.Thread(target=prefill_worker, args=(prefill_wrapper, prefill_q, prefill_kv, args.runs, ready_event))
-        decode_thread = threading.Thread(target=decode_worker, args=(decode_wrapper, decode_q, decode_kv, args.runs, args.sm, ready_event))
+        prefill_thread = threading.Thread(target=prefill_worker, args=(prefill_wrapper, prefill_q, prefill_kv_paged, args.runs, ready_event))
+        decode_thread = threading.Thread(target=decode_worker, args=(decode_wrapper, decode_q, decode_kv_paged, args.runs, args.sm, ready_event))
         
         # 5. 计时并执行
         print("\n开始并发性能测试...")
@@ -146,8 +142,8 @@ def main():
         # 预热
         print("\n预热阶段 (顺序)...")
         for _ in range(2):
-            prefill_wrapper.run(prefill_q, prefill_kv)
-            decode_wrapper.run(decode_q, decode_kv)
+            prefill_wrapper.run(prefill_q, prefill_kv_paged)
+            decode_wrapper.run(decode_q, decode_kv_paged)
         torch.cuda.synchronize()
 
         print("\n开始顺序性能测试...")
@@ -157,10 +153,10 @@ def main():
         start_event.record()
         
         # 批量提交所有prefill任务
-        sequential_worker(prefill_wrapper, prefill_q, prefill_kv, args.runs, "Prefill")
+        sequential_worker(prefill_wrapper, (prefill_q, prefill_kv_paged), args.runs, "Prefill (Paged)")
         
         # 批量提交所有decode任务
-        sequential_worker(decode_wrapper, decode_q, decode_kv, args.runs * 100, "Decode")
+        sequential_worker(decode_wrapper, (decode_q, decode_kv_paged), args.runs * 100, "Decode (Paged)")
         
         # 最后一次总同步
         torch.cuda.synchronize()

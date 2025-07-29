@@ -1,9 +1,0 @@
-README.md
-green_context_wrapper.cu
-setup.py
-green_context_lib.egg-info/PKG-INFO
-green_context_lib.egg-info/SOURCES.txt
-green_context_lib.egg-info/dependency_links.txt
-green_context_lib.egg-info/not-zip-safe
-green_context_lib.egg-info/requires.txt
-green_context_lib.egg-info/top_level.txt
