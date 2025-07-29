@@ -8,6 +8,7 @@ namespace py = pybind11;
 // 全局变量存储 Green Context 状态
 static CUgreenCtx g_green_ctx = nullptr;
 static CUcontext g_context = nullptr;
+static CUcontext g_default_context = nullptr;
 static bool g_initialized = false;
 
 bool create_green_context(int sm_count = 8) {
@@ -15,7 +16,13 @@ bool create_green_context(int sm_count = 8) {
         return true; // 已经初始化
     }
     
-    CUresult res;
+    // 保存当前的默认context
+    CUresult res = cuCtxGetCurrent(&g_default_context);
+    if (res != CUDA_SUCCESS) {
+        std::cerr << "无法获取当前默认context" << std::endl;
+        return false;
+    }
+    
     CUdevice device;
     CUdevResource dev_resource = {};
     CUdevResource sm_resources[2] = {{}, {}};
@@ -75,24 +82,52 @@ bool create_green_context(int sm_count = 8) {
         return false;
     }
     
-    // 设为当前上下文
-    res = cuCtxSetCurrent(g_context);
-    if (res != CUDA_SUCCESS) {
-        std::cerr << "设置当前上下文失败" << std::endl;
-        return false;
-    }
-    
     g_initialized = true;
     return true;
 }
 
 void destroy_green_context() {
     if (g_initialized && g_green_ctx) {
+        // 先切换回默认context
+        if (g_default_context) {
+            cuCtxSetCurrent(g_default_context);
+        }
         cuGreenCtxDestroy(g_green_ctx);
         g_green_ctx = nullptr;
         g_context = nullptr;
+        g_default_context = nullptr;
         g_initialized = false;
     }
+}
+
+bool switch_to_green_context() {
+    if (!g_initialized || !g_context) {
+        std::cerr << "Green Context未初始化，请先调用create_green_context" << std::endl;
+        return false;
+    }
+    
+    CUresult res = cuCtxSetCurrent(g_context);
+    if (res != CUDA_SUCCESS) {
+        std::cerr << "切换到Green Context失败" << std::endl;
+        return false;
+    }
+    
+    return true;
+}
+
+bool switch_to_default_context() {
+    if (!g_default_context) {
+        std::cerr << "默认Context不可用" << std::endl;
+        return false;
+    }
+    
+    CUresult res = cuCtxSetCurrent(g_default_context);
+    if (res != CUDA_SUCCESS) {
+        std::cerr << "切换到默认Context失败" << std::endl;
+        return false;
+    }
+    
+    return true;
 }
 
 bool is_green_context_active() {
@@ -107,6 +142,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     
     m.def("destroy_green_context", &destroy_green_context, 
           "Destroy Green Context");
+    
+    m.def("switch_to_green_context", &switch_to_green_context, 
+          "Switch to Green Context");
+    
+    m.def("switch_to_default_context", &switch_to_default_context, 
+          "Switch to default Context");
     
     m.def("is_green_context_active", &is_green_context_active, 
           "Check if Green Context is active");
