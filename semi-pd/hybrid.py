@@ -2,7 +2,8 @@ import torch
 import flashinfer
 import green_context_lib as green_context
 import argparse
-import threading
+import torch.multiprocessing as mp
+import time
 
 page_size = 16
 num_kv_heads = 8   # GQA: KV heads
@@ -39,29 +40,67 @@ def setup_paged_data(batch_size=64, kv_len=4096, qo_len=4096):
 
     return q, paged_kv_cache, paged_kv_indices, paged_kv_indptr, paged_kv_last_page_len, qo_indptr
 
-def prefill_worker(wrapper, q, kv_cache, runs, ready_event):
-    """在默认context下运行prefill的线程函数 (Paged)"""
-    print("Prefill worker: 等待开始...")
-    ready_event.wait() # 等待主线程信号
-    print("Prefill worker: 开始执行")
-    for _ in range(runs):
-        wrapper.run(q, kv_cache)
+def prefill_worker(q, kv_cache, runs, sm_count, ready_event,
+                   qo_indptr, paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len):
+    """在green context下运行prefill的进程函数 (Paged)"""
+    # 在进程内部分配资源并plan
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0"), "NHD")
+    wrapper.plan(qo_indptr=qo_indptr, paged_kv_indptr=paged_kv_indptr, paged_kv_indices=paged_kv_indices,
+                         paged_kv_last_page_len=paged_kv_last_page_len, num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads,
+                         head_dim_qk=head_dim, page_size=page_size, causal=True)
 
-def decode_worker(wrapper, q, kv_cache, runs, sm_count, ready_event):
-    """在green context下运行decode的线程函数"""
+    print("Prefill worker: 等待开始...")
+    if not green_context.create_green_context(sm_count=sm_count):
+        print(f"Prefill worker: 无法创建Green Context ({sm_count} SMs)")
+        return
+    if not green_context.switch_to_green_context():
+        print(f"Prefill worker: 无法切换到Green Context")
+        green_context.destroy_green_context()
+        return
+    
+    try:
+        # 预热
+        for _ in range(2):
+            wrapper.run(q, kv_cache)
+        torch.cuda.synchronize()
+
+        ready_event.wait() # 等待主线程信号
+        print(f"Prefill worker: 开始执行 (在 {sm_count} SMs Green Context中)")
+        for _ in range(runs):
+            wrapper.run(q, kv_cache)
+        torch.cuda.synchronize()
+    finally:
+        green_context.destroy_green_context()
+        print("Prefill worker: 已销毁Green Context")
+
+def decode_worker(q, kv_cache, runs, sm_count, ready_event,
+                    qo_indptr, paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len):
+    """在green context下运行decode的进程函数"""
+    # 在进程内部分配资源并plan
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0"), "NHD")
+    wrapper.plan(qo_indptr=qo_indptr, paged_kv_indptr=paged_kv_indptr, paged_kv_indices=paged_kv_indices,
+                         paged_kv_last_page_len=paged_kv_last_page_len, num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads,
+                         head_dim_qk=head_dim, page_size=page_size, causal=False)
+
     print("Decode worker: 等待开始...")
     if not green_context.create_green_context(sm_count=sm_count):
-        print(f"Decode worker: 无法创建Green Context")
+        print(f"Decode worker: 无法创建Green Context ({sm_count} SMs)")
         return
     if not green_context.switch_to_green_context():
         print(f"Decode worker: 无法切换到Green Context")
         green_context.destroy_green_context()
         return
     try:
+        # 预热
+        for _ in range(2):
+            wrapper.run(q, kv_cache)
+        torch.cuda.synchronize()
+
         ready_event.wait() # 等待主线程信号
-        print("Decode worker: 开始执行 (在Green Context中)")
+        print(f"Decode worker: 开始执行 (在 {sm_count} SMs Green Context中)")
         for _ in range(runs * 100): # 运行更多次以确保重叠
             wrapper.run(q, kv_cache)
+        torch.cuda.synchronize()
     finally:
         green_context.destroy_green_context()
         print("Decode worker: 已销毁Green Context")
@@ -81,11 +120,18 @@ def sequential_worker(wrapper, data_args, runs, kernel_name, run_multiplier=1):
 
 def main():
     parser = argparse.ArgumentParser(description='Concurrent FlashInfer Prefill + Decode Benchmark')
-    parser.add_argument('--sm', type=int, default=30, help='SM count for decode Green Context (仅在并发模式下有效)')
+    parser.add_argument('--sm_prefill', type=int, default=40, help='SM count for prefill Green Context (仅在并发模式下有效)')
+    parser.add_argument('--sm_decode', type=int, default=30, help='SM count for decode Green Context (仅在并发模式下有效)')
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--runs', type=int, default=10)
     parser.add_argument('--mode', choices=['sequential', 'concurrent'], default='concurrent', help='执行模式')
     args = parser.parse_args()
+
+    # 为CUDA + multiprocessing 设置 'spawn' 启动方法
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
 
     print(f"=== FlashInfer {args.mode.capitalize()} 测试 ===")
     
@@ -93,52 +139,49 @@ def main():
     prefill_q, prefill_kv_paged, prefill_indices, prefill_indptr, prefill_last_len, prefill_qo_indptr = setup_paged_data(batch_size=args.batch_size, qo_len=4096)
     decode_q, decode_kv_paged, decode_indices, decode_indptr, decode_last_len, decode_qo_indptr = setup_paged_data(batch_size=args.batch_size, qo_len=1)
     
-    # 2. 在主线程(默认context)中创建和plan wrappers
-    prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0"), "NHD")
-    decode_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0"), "NHD")
-    
-    prefill_wrapper.plan(qo_indptr=prefill_qo_indptr, paged_kv_indptr=prefill_indptr, paged_kv_indices=prefill_indices,
-                         paged_kv_last_page_len=prefill_last_len, num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads,
-                         head_dim_qk=head_dim, page_size=page_size, causal=True)
-                         
-    decode_wrapper.plan(qo_indptr=decode_qo_indptr, paged_kv_indptr=decode_indptr, paged_kv_indices=decode_indices,
-                         paged_kv_last_page_len=decode_last_len, num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads,
-                         head_dim_qk=head_dim, page_size=page_size, causal=False)
-
     if args.mode == 'concurrent':
-        # 3. 预热
-        print("\n预热阶段 (并发)...")
-        for _ in range(2):
-            prefill_wrapper.run(prefill_q, prefill_kv_paged)
-            decode_wrapper.run(decode_q, decode_kv_paged)
-        torch.cuda.synchronize()
+        # 4. 创建进程
+        ready_event = mp.Event()
 
-        # 4. 创建线程
-        ready_event = threading.Event()
-        prefill_thread = threading.Thread(target=prefill_worker, args=(prefill_wrapper, prefill_q, prefill_kv_paged, args.runs, ready_event))
-        decode_thread = threading.Thread(target=decode_worker, args=(decode_wrapper, decode_q, decode_kv_paged, args.runs, args.sm, ready_event))
-        
+        prefill_args = (
+            prefill_q, prefill_kv_paged, args.runs, args.sm_prefill, ready_event,
+            prefill_qo_indptr, prefill_indptr, prefill_indices, prefill_last_len
+        )
+        prefill_process = mp.Process(target=prefill_worker, args=prefill_args)
+
+        decode_args = (
+            decode_q, decode_kv_paged, args.runs, args.sm_decode, ready_event,
+            decode_qo_indptr, decode_indptr, decode_indices, decode_last_len
+        )
+        decode_process = mp.Process(target=decode_worker, args=decode_args)
+
         # 5. 计时并执行
         print("\n开始并发性能测试...")
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
         
-        prefill_thread.start()
-        decode_thread.start()
+        prefill_process.start()
+        decode_process.start()
         
-        start_event.record()
+        # 等待worker初始化完成
+        time.sleep(3) 
+        
         ready_event.set() # 发送开始信号
         
-        prefill_thread.join()
-        decode_thread.join()
+        prefill_process.join()
+        decode_process.join()
         
-        end_event.record()
-        torch.cuda.synchronize()
-        
-        total_time = start_event.elapsed_time(end_event)
         print("\n=== 并发测试完成 ===")
-        print(f"并发总时间: {total_time:.3f} ms")
     else: # sequential 模式
+        # 顺序模式下，wrapper需要在主进程中创建
+        prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0"), "NHD")
+        decode_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0"), "NHD")
+    
+        prefill_wrapper.plan(qo_indptr=prefill_qo_indptr, paged_kv_indptr=prefill_indptr, paged_kv_indices=prefill_indices,
+                             paged_kv_last_page_len=prefill_last_len, num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads,
+                             head_dim_qk=head_dim, page_size=page_size, causal=True)
+                             
+        decode_wrapper.plan(qo_indptr=decode_qo_indptr, paged_kv_indptr=decode_indptr, paged_kv_indices=decode_indices,
+                             paged_kv_last_page_len=decode_last_len, num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads,
+                             head_dim_qk=head_dim, page_size=page_size, causal=False)
         # 预热
         print("\n预热阶段 (顺序)...")
         for _ in range(2):
