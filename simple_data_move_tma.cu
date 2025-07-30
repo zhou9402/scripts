@@ -69,8 +69,8 @@ __device__ __forceinline__ void tma_store_1d(const void* smem_ptr, const void* g
                                              bool evict_first = true) {
     auto smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
     const auto cache_hint = evict_first ? kEvictFirst : kEvictNormal;
-    asm volatile("cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;\n"
-                 :: "l"(gmem_ptr), "r"(smem_int_ptr), "r"(num_bytes): "memory");
+    asm volatile("cp.async.bulk.global.shared::cta.bulk_group.L2::cache_hint [%0], [%1], %2, %3;\n"
+                 :: "l"(gmem_ptr), "r"(smem_int_ptr), "r"(num_bytes), "l"(cache_hint) : "memory");
     asm volatile("cp.async.bulk.commit_group;");
 }
 
@@ -80,12 +80,16 @@ __device__ __forceinline__ void tma_store_wait() {
 }
 
 
-// A proper TMA bulk copy kernel for Hopper
+// A proper TMA bulk copy kernel for Hopper - Grid-stride loop with 32KB per iteration
 __global__ void tma_bulk_copy_kernel(
     void *__restrict__ vdst,
     const void *__restrict__ vsrc,
     int N)
 {
+    // 每次copy 32KB = 8192个float
+    const int elements_per_chunk = 8192;  // 32KB / 4 bytes per float
+    const int bytes_per_chunk = elements_per_chunk * sizeof(float);  // 32KB
+    
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
     auto *dst = reinterpret_cast<float *>(vdst);
     const auto *src = reinterpret_cast<const float *>(vsrc);
@@ -101,27 +105,50 @@ __global__ void tma_bulk_copy_kernel(
     }
     __syncthreads();
 
-    // --- TMA Load: Global -> Shared ---
-    if (threadIdx.x == 0)
-    {
-        // The tma_load_1d function encapsulates the mbarrier arrive and cp.async.bulk instructions
-        tma_load_1d(smem_buffer, src, &tma_mbarrier, N * sizeof(float));
-        mbarrier_arrive_and_expect_tx(&tma_mbarrier,  N * sizeof(float));
-        // Wait for TMA load to complete
-        mbarrier_wait(&tma_mbarrier, tma_phase);
-        // --- TMA Store: Shared -> Global ---
-        tma_store_1d(smem_buffer, dst, N * sizeof(float));
-        tma_store_wait();
+    // Grid-stride loop: 每个block轮流处理32KB数据块
+    for (int chunk_start = blockIdx.x * elements_per_chunk; 
+         chunk_start < N; 
+         chunk_start += gridDim.x * elements_per_chunk) {
+        
+        // 计算当前chunk的实际大小
+        int chunk_end = min(chunk_start + elements_per_chunk, N);
+        int elements_to_process = chunk_end - chunk_start;
+        int bytes_to_process = elements_to_process * sizeof(float);
+        
+        // 跳过空的chunk
+        if (elements_to_process <= 0) {
+            break;
+        }
+
+        // --- TMA Load: Global -> Shared ---
+        if (threadIdx.x == 0)
+        {
+            // 计算当前chunk的源地址和目标地址
+            const float* chunk_src = src + chunk_start;
+            float* chunk_dst = dst + chunk_start;
+            
+            // TMA加载：从global memory的当前chunk位置加载到shared memory
+            tma_load_1d(smem_buffer, chunk_src, &tma_mbarrier, bytes_to_process);
+            mbarrier_arrive_and_expect_tx(&tma_mbarrier, bytes_to_process);
+            
+            // 等待TMA加载完成
+            mbarrier_wait(&tma_mbarrier, tma_phase);
+            
+            // --- TMA Store: Shared -> Global ---
+            // TMA存储：从shared memory存储到global memory的当前chunk位置
+            tma_store_1d(smem_buffer, chunk_dst, bytes_to_process);
+            tma_store_wait();
+        }
+        
+        // 等待当前chunk的TMA操作完成再进行下一个chunk
+        __syncthreads();
     }
-    
-    // Wait for TMA store to complete
-    __syncthreads();
 }
 
 int main(int argc, char **argv)
 {
     printf("=============================================================================\n");
-    printf("TMA (Tensor Memory Accelerator) Bulk Copy 1D Test\n");
+    printf("TMA (Tensor Memory Accelerator) Grid-Stride Copy Test - 32KB per chunk\n");
     printf("=============================================================================\n");
 
     
@@ -139,15 +166,35 @@ int main(int argc, char **argv)
     }
     printf("✅ TMA support detected\n");
 
-    // Parameters
-    int N = argc > 1 ? atoi(argv[1]) : 1024;
+    // Parameters - 默认更大的数据量以测试多轮copy
+    int N = argc > 1 ? atoi(argv[1]) : 256 * 1024;  // 默认256K个float = 1MB
 
     // TMA requires 16-byte alignment for some operations, good practice to align.
     N = (N + 3) & ~3; 
-    printf("N = %d\n", N);
+    printf("Total elements: N = %d floats\n", N);
 
     size_t size = N * sizeof(float);
-    printf("Array size: %d elements (%.1f KB)\n", N, size / 1024.0f);
+    printf("Total data size: %.1f KB (%.1f MB)\n", size / 1024.0f, size / 1024.0f / 1024.0f);
+    
+    // 配置grid：每个block处理32KB chunks
+    const int elements_per_chunk = 8192;  // 32KB / 4 bytes = 8192 floats
+    const int chunk_size_kb = 32;
+    
+    // 计算需要的总chunk数量
+    int total_chunks = (N + elements_per_chunk - 1) / elements_per_chunk;
+    
+    // 设置block数量：可以小于总chunk数，利用grid-stride loop
+    // 建议设置为SM数量的倍数以获得好的负载均衡
+    int num_sms = prop.multiProcessorCount;
+    int num_blocks = min(total_chunks, num_sms * 4);  // 每个SM最多4个block
+    
+    printf("\nConfiguration:\n");
+    printf("  Elements per chunk: %d (%dKB)\n", elements_per_chunk, chunk_size_kb);
+    printf("  Total chunks needed: %d\n", total_chunks);
+    printf("  Number of SMs: %d\n", num_sms);
+    printf("  Number of blocks: %d\n", num_blocks);
+    printf("  Threads per block: 1024\n");
+    printf("  Each block will process ~%.1f chunks on average\n", (float)total_chunks / num_blocks);
 
     // Allocate memory
     float *h_src, *h_dst;
@@ -172,32 +219,37 @@ int main(int argc, char **argv)
     cudaEvent_t start, stop;
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));
-    // size_t smem_size;
-    // CUDA_CHECK(cudaFuncSetAttribute(tma_bulk_copy_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     
-    const int num_runs = 100;
+    const int num_runs = 50;
     float times[num_runs];
 
-    // Set shared memory size
-    size_t smem_size = N * sizeof(float);
-    printf("props shared = %d\n", prop.sharedMemPerBlock);
-    printf("smem_size = %zu\n", smem_size);
+    // Set shared memory size - 每个block需要32KB用于chunk缓存
+    size_t smem_size = elements_per_chunk * sizeof(float);  // 32KB
+    printf("\nShared memory per block: %zu bytes (%dKB)\n", smem_size, chunk_size_kb);
+    
     if (smem_size > (size_t)prop.sharedMemPerBlock) {
-        printf("Error: Requested shared memory size %zu bytes is larger than max %d bytes\n", smem_size, prop.sharedMemPerBlock);
+        printf("Error: Requested shared memory size %zu bytes is larger than max %d bytes\n", 
+               smem_size, prop.sharedMemPerBlock);
         return 1;
     }
     
-    printf("\nRunning %d TMA tests using smem_size = %zu bytes...\n", num_runs, smem_size);
+    // 设置kernel属性
+    CUDA_CHECK(cudaFuncSetAttribute(tma_bulk_copy_kernel, 
+                                   cudaFuncAttributeMaxDynamicSharedMemorySize, 
+                                   smem_size));
+    
+    printf("\nRunning %d TMA grid-stride tests...\n", num_runs);
 
     // Warm-up run
-    tma_bulk_copy_kernel<<<1, 1, smem_size>>>(d_dst, d_src, N);
+    printf("Warming up...\n");
+    tma_bulk_copy_kernel<<<num_blocks, 1024, smem_size>>>(d_dst, d_src, N);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Test
     for (int i = 0; i < num_runs; i++)
     {
         CUDA_CHECK(cudaEventRecord(start));
-        tma_bulk_copy_kernel<<<1, 1, smem_size>>>(d_dst, d_src, N);
+        tma_bulk_copy_kernel<<<num_blocks, 1024, smem_size>>>(d_dst, d_src, N);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaEventRecord(stop));
         CUDA_CHECK(cudaEventSynchronize(stop));
@@ -224,6 +276,14 @@ int main(int argc, char **argv)
     }
 
     float avg_time = total_time / num_runs;
+    
+    // Calculate standard deviation
+    float variance = 0.0f;
+    for (int i = 0; i < num_runs; i++) {
+        float diff = times[i] - avg_time;
+        variance += diff * diff;
+    }
+    float std_dev = sqrt(variance / num_runs);
 
     // Verify result
     CUDA_CHECK(cudaMemcpy(h_dst, d_dst, size, cudaMemcpyDeviceToHost));
@@ -259,12 +319,19 @@ int main(int argc, char **argv)
         printf("✅ TMA data verification passed! (checked %d elements)\n", min(2 * check_count, N));
     }
 
-    printf("\n=== TMA Results ===\n");
-    printf("Time (ms): Min=%.3f, Avg=%.3f, Max=%.3f\n", min_time, avg_time, max_time);
+    printf("\n=== Grid-Stride TMA Results ===\n");
+    printf("Data size: %.1f KB (%d floats)\n", size / 1024.0f, N);
+    printf("Chunk size: %dKB (%d floats)\n", chunk_size_kb, elements_per_chunk);
+    printf("Total chunks: %d, Blocks: %d\n", total_chunks, num_blocks);
+    printf("Time (ms):\n");
+    printf("  Min:    %.3f\n", min_time);
+    printf("  Max:    %.3f\n", max_time);
+    printf("  Avg:    %.3f ± %.3f\n", avg_time, std_dev);
 
     double bandwidth = (size * 2 / (avg_time / 1000.0)) / 1e9; // read+write
     printf("Bandwidth: %.1f GB/s\n", bandwidth);
-    printf("✅ Using Hardware TMA (Tensor Memory Accelerator)\n");
+    printf("Coefficient of Variation: %.2f%%\n", (std_dev / avg_time) * 100.0f);
+    printf("✅ Using Hardware TMA (Tensor Memory Accelerator) with grid-stride loop\n");
 
     // Cleanup
     free(h_src);
@@ -274,6 +341,6 @@ int main(int argc, char **argv)
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
 
-    printf("\n=== TMA Test Complete ===\n");
+    printf("\n=== Grid-Stride TMA Test Complete ===\n");
     return 0;
 }
