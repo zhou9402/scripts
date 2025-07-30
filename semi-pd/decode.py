@@ -58,6 +58,10 @@ def benchmark_flashinfer(q, paged_kv_cache, paged_kv_indices, paged_kv_indptr, p
         if not green_context.create_green_context(sm_count=sm_count):
              print(f"Failed to create Green Context with {sm_count} SMs")
              return None
+        if not green_context.switch_to_green_context():
+             print(f"Failed to switch to Green Context")
+             green_context.destroy_green_context()
+             return None
 
     try:
         # 分配workspace buffer
