@@ -62,7 +62,7 @@ __device__ __forceinline__ void tma_load_1d(const void* smem_ptr, const void* gm
     auto smem_int_ptr  = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
     const auto cache_hint = evict_first ? kEvictFirst : kEvictNormal;
     asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;\n"
-                 :: "r"(smem_int_ptr), "l"(gmem_ptr), "r"(num_bytes), "r"(mbar_int_ptr), "l"(cache_hint) : "memory");
+                 :: "r"(smem_int_ptr), "l"(gmem_ptr), "r"(num_bytes), "r"(mbar_int_ptr), L2::no_allocate : "memory");
 }
 
 __device__ __forceinline__ void tma_store_1d(const void* smem_ptr, const void* gmem_ptr, int num_bytes,
@@ -70,7 +70,7 @@ __device__ __forceinline__ void tma_store_1d(const void* smem_ptr, const void* g
     auto smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
     const auto cache_hint = evict_first ? kEvictFirst : kEvictNormal;
     asm volatile("cp.async.bulk.global.shared::cta.bulk_group.L2::cache_hint [%0], [%1], %2, %3;\n"
-                 :: "l"(gmem_ptr), "r"(smem_int_ptr), "r"(num_bytes), "l"(cache_hint) : "memory");
+                 :: "l"(gmem_ptr), "r"(smem_int_ptr), "r"(num_bytes), L2::evict_first : "memory");
     asm volatile("cp.async.bulk.commit_group;");
 }
 
