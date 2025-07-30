@@ -40,7 +40,7 @@ def setup_paged_data(batch_size=64, kv_len=4096, qo_len=4096):
 
     return q, paged_kv_cache, paged_kv_indices, paged_kv_indptr, paged_kv_last_page_len, qo_indptr
 
-def prefill_worker(q, kv_cache, runs, sm_count, ready_event,
+def prefill_worker(q, kv_cache, runs, sm_count, ready_event, result_queue,
                    qo_indptr, paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len):
     """在green context下运行prefill的进程函数 (Paged)"""
     # 在进程内部分配资源并plan
@@ -52,10 +52,12 @@ def prefill_worker(q, kv_cache, runs, sm_count, ready_event,
     print("Prefill worker: 等待开始...")
     if not green_context.create_green_context(sm_count=sm_count):
         print(f"Prefill worker: 无法创建Green Context ({sm_count} SMs)")
+        result_queue.put(("prefill", -1))
         return
     if not green_context.switch_to_green_context():
         print(f"Prefill worker: 无法切换到Green Context")
         green_context.destroy_green_context()
+        result_queue.put(("prefill", -1))
         return
     
     try:
@@ -66,14 +68,25 @@ def prefill_worker(q, kv_cache, runs, sm_count, ready_event,
 
         ready_event.wait() # 等待主线程信号
         print(f"Prefill worker: 开始执行 (在 {sm_count} SMs Green Context中)")
+        
+        # 计时开始
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        
+        start_event.record()
         for _ in range(runs):
             wrapper.run(q, kv_cache)
+        end_event.record()
         torch.cuda.synchronize()
+        
+        elapsed_time = start_event.elapsed_time(end_event)
+        result_queue.put(("prefill", elapsed_time))
+        print(f"Prefill worker: 完成 {runs} 次运行，耗时: {elapsed_time:.3f} ms")
     finally:
         green_context.destroy_green_context()
         print("Prefill worker: 已销毁Green Context")
 
-def decode_worker(q, kv_cache, runs, sm_count, ready_event,
+def decode_worker(q, kv_cache, runs, sm_count, ready_event, result_queue,
                     qo_indptr, paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len):
     """在green context下运行decode的进程函数"""
     # 在进程内部分配资源并plan
@@ -85,10 +98,12 @@ def decode_worker(q, kv_cache, runs, sm_count, ready_event,
     print("Decode worker: 等待开始...")
     if not green_context.create_green_context(sm_count=sm_count):
         print(f"Decode worker: 无法创建Green Context ({sm_count} SMs)")
+        result_queue.put(("decode", -1))
         return
     if not green_context.switch_to_green_context():
         print(f"Decode worker: 无法切换到Green Context")
         green_context.destroy_green_context()
+        result_queue.put(("decode", -1))
         return
     try:
         # 预热
@@ -98,9 +113,21 @@ def decode_worker(q, kv_cache, runs, sm_count, ready_event,
 
         ready_event.wait() # 等待主线程信号
         print(f"Decode worker: 开始执行 (在 {sm_count} SMs Green Context中)")
-        for _ in range(runs * 100): # 运行更多次以确保重叠
+        
+        # 计时开始
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        
+        total_runs = runs * 100  # 运行更多次以确保重叠
+        start_event.record()
+        for _ in range(total_runs):
             wrapper.run(q, kv_cache)
+        end_event.record()
         torch.cuda.synchronize()
+        
+        elapsed_time = start_event.elapsed_time(end_event)
+        result_queue.put(("decode", elapsed_time))
+        print(f"Decode worker: 完成 {total_runs} 次运行，耗时: {elapsed_time:.3f} ms")
     finally:
         green_context.destroy_green_context()
         print("Decode worker: 已销毁Green Context")
@@ -110,13 +137,24 @@ def sequential_worker(wrapper, data_args, runs, kernel_name, run_multiplier=1):
     print(f"\n--- 提交 {kernel_name} 任务 ---")
     
     total_runs = runs * run_multiplier
+    
+    # 计时开始
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    
+    start_event.record()
     # 批量提交所有任务
     for i in range(total_runs):
         if (i + 1) % 100 == 0:
             print(f"  {kernel_name}: 提交第 {i+1}/{total_runs} 个任务...")
         wrapper.run(*data_args)
+    end_event.record()
+    torch.cuda.synchronize()
     
-    print(f"  {kernel_name}: {total_runs} 个任务提交完成。")
+    elapsed_time = start_event.elapsed_time(end_event)
+    print(f"  {kernel_name}: {total_runs} 个任务提交完成，耗时: {elapsed_time:.3f} ms")
+    
+    return elapsed_time
 
 def main():
     parser = argparse.ArgumentParser(description='Concurrent FlashInfer Prefill + Decode Benchmark')
@@ -142,21 +180,28 @@ def main():
     if args.mode == 'concurrent':
         # 4. 创建进程
         ready_event = mp.Event()
+        result_queue = mp.Queue()
 
         prefill_args = (
-            prefill_q, prefill_kv_paged, args.runs, args.sm_prefill, ready_event,
+            prefill_q, prefill_kv_paged, args.runs, args.sm_prefill, ready_event, result_queue,
             prefill_qo_indptr, prefill_indptr, prefill_indices, prefill_last_len
         )
         prefill_process = mp.Process(target=prefill_worker, args=prefill_args)
 
         decode_args = (
-            decode_q, decode_kv_paged, args.runs, args.sm_decode, ready_event,
+            decode_q, decode_kv_paged, args.runs, args.sm_decode, ready_event, result_queue,
             decode_qo_indptr, decode_indptr, decode_indices, decode_last_len
         )
         decode_process = mp.Process(target=decode_worker, args=decode_args)
 
         # 5. 计时并执行
         print("\n开始并发性能测试...")
+        
+        # 总体计时开始
+        overall_start_event = torch.cuda.Event(enable_timing=True)
+        overall_end_event = torch.cuda.Event(enable_timing=True)
+        
+        overall_start_event.record()
         
         prefill_process.start()
         decode_process.start()
@@ -169,7 +214,34 @@ def main():
         prefill_process.join()
         decode_process.join()
         
+        overall_end_event.record()
+        torch.cuda.synchronize()
+        
+        # 收集结果
+        results = {}
+        for _ in range(2):  # 收集两个进程的结果
+            worker_type, elapsed_time = result_queue.get()
+            results[worker_type] = elapsed_time
+        
+        overall_time = overall_start_event.elapsed_time(overall_end_event)
+        
         print("\n=== 并发测试完成 ===")
+        print(f"并发执行总时间: {overall_time:.3f} ms")
+        if 'prefill' in results and results['prefill'] > 0:
+            print(f"Prefill 时间: {results['prefill']:.3f} ms")
+        else:
+            print(f"Prefill 时间: 执行失败")
+        if 'decode' in results and results['decode'] > 0:
+            print(f"Decode 时间: {results['decode']:.3f} ms")
+        else:
+            print(f"Decode 时间: 执行失败")
+        
+        # 计算重叠效率
+        if 'prefill' in results and 'decode' in results and results['prefill'] > 0 and results['decode'] > 0:
+            sequential_estimate = results['prefill'] + results['decode']
+            overlap_efficiency = (sequential_estimate - overall_time) / sequential_estimate * 100
+            print(f"估计顺序执行时间: {sequential_estimate:.3f} ms")
+            print(f"重叠效率: {overlap_efficiency:.1f}%")
     else: # sequential 模式
         # 顺序模式下，wrapper需要在主进程中创建
         prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0"), "NHD")
@@ -196,10 +268,10 @@ def main():
         start_event.record()
         
         # 批量提交所有prefill任务
-        sequential_worker(prefill_wrapper, (prefill_q, prefill_kv_paged), args.runs, "Prefill (Paged)")
+        prefill_time = sequential_worker(prefill_wrapper, (prefill_q, prefill_kv_paged), args.runs, "Prefill (Paged)")
         
         # 批量提交所有decode任务
-        sequential_worker(decode_wrapper, (decode_q, decode_kv_paged), args.runs * 100, "Decode (Paged)")
+        decode_time = sequential_worker(decode_wrapper, (decode_q, decode_kv_paged), args.runs * 100, "Decode (Paged)")
         
         # 最后一次总同步
         torch.cuda.synchronize()
@@ -209,6 +281,8 @@ def main():
         total_time = start_event.elapsed_time(end_event)
         print("\n=== 顺序执行总结 ===")
         print(f"顺序执行总时间: {total_time:.3f} ms")
+        print(f"Prefill 总时间: {prefill_time:.3f} ms")
+        print(f"Decode 总时间: {decode_time:.3f} ms")
 
 if __name__ == "__main__":
     main()
