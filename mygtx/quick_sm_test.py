@@ -139,12 +139,12 @@ def main():
         print("无法获取库信息")
     
     # 固定配置
-    qo_len = 128
+    qo_len = 1
     
     print("\n设置测试数据...")
     q, k, v = setup_data(qo_len=qo_len)
     
-    sm_counts = [10, 20, 30, 40, 50, 60, 70, 80]
+    sm_counts = [8, 16, 32, 64, 72, 80, 96, 112, 128, 144, 160, 176, 188]
     
     print(f"\n测试SM数量范围: {sm_counts}")
     
