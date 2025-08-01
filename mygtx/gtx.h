@@ -7,6 +7,8 @@
 // Cpp
 #include <array>
 #include <cstdio> // printf
+#include <string> // string support
+#include <vector> // vector support
 
 // Utility
 
