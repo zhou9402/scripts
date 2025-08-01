@@ -139,7 +139,7 @@ def main():
         print("无法获取库信息")
     
     # 固定配置
-    qo_len = 1
+    qo_len = 4096
     
     print("\n设置测试数据...")
     q, k, v = setup_data(qo_len=qo_len)
