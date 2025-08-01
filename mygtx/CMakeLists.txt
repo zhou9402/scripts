@@ -75,21 +75,21 @@ if(BUILD_PYTHON_BINDINGS)
     message(STATUS "Building Python extension module")
     
     # Create Python extension module
-    pybind11_add_module(green_context_simple gtx.cpp)
+    pybind11_add_module(gtx gtx.cpp)
     
     # Link libraries
-    target_link_libraries(green_context_simple PRIVATE 
+    target_link_libraries(gtx PRIVATE 
         CUDA::cuda_driver
         CUDA::cudart
     )
     
     # Set properties
-    set_target_properties(green_context_simple PROPERTIES
+    set_target_properties(gtx PROPERTIES
         LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     )
     
-    message(STATUS "Python extension will be built as: green_context_simple")
+    message(STATUS "Python extension will be built as: gtx")
 else()
     message(STATUS "Skipping Python bindings (pybind11 not found)")
 endif()
