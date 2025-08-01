@@ -9,15 +9,15 @@ that was compiled from C++ with Python bindings.
 import sys
 import os
 
-def test_gtx():
+def test_green_context_simple():
     """Test the Green Context Simple library"""
     
     try:
         # Import the compiled library
         print("=== Green Context Simple Library Example ===")
-        print("Importing gtx library...")
+        print("Importing green_context_simple library...")
         
-        import gtx as gc
+        import green_context_simple as gc
         print(f"✅ Library imported successfully!")
         print(f"📦 Library version: {gc.__version__}")
         print()
@@ -103,7 +103,7 @@ def test_gtx():
         return True
         
     except ImportError as e:
-        print(f"❌ Failed to import gtx: {e}")
+        print(f"❌ Failed to import green_context_simple: {e}")
         print()
         print("Troubleshooting:")
         print("1. Make sure the .so file is in the current directory or Python path")
@@ -124,7 +124,7 @@ def advanced_usage_example():
     print("="*60)
     
     try:
-        import gtx as gc
+        import green_context_simple as gc
         
         class GreenContextManager:
             """Context manager wrapper for automatic resource cleanup"""
@@ -176,14 +176,14 @@ def advanced_usage_example():
         print("✅ Context manager automatically cleaned up resources!")
         
     except ImportError:
-        print("❌ gtx not available for advanced example")
+        print("❌ green_context_simple not available for advanced example")
 
 if __name__ == "__main__":
     print("Green Context Simple Library - Usage Example")
     print("=" * 50)
     
     # Check if we're in the right directory
-    so_files = [f for f in os.listdir('.') if f.startswith('gtx') and f.endswith('.so')]
+    so_files = [f for f in os.listdir('.') if f.startswith('green_context_simple') and f.endswith('.so')]
     if so_files:
         print(f"📁 Found library file: {so_files[0]}")
     else:
@@ -193,7 +193,7 @@ if __name__ == "__main__":
     print()
     
     # Run basic tests
-    success = test_gtx()
+    success = test_green_context_simple()
     
     if success:
         # Run advanced example
@@ -201,7 +201,7 @@ if __name__ == "__main__":
         
         print("\n" + "="*60)
         print("🎉 Example completed successfully!")
-        print("You can now use gtx in your own projects!")
+        print("You can now use green_context_simple in your own projects!")
         print("="*60)
     else:
         print("\n❌ Basic tests failed. Please check the library compilation and environment.")
