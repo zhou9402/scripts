@@ -174,8 +174,8 @@ CUresult create_green_context_and_stream_1t1g(
         primary_partition_device_resource = device_resource;
         remaining_partition_device_resource = device_resource;
     }
-    printf("[Device %d] [Primary Partition] (for GEMM) sm count: %d\n", device_id, primary_partition_device_resource.sm.smCount); fflush(stdout);
-    printf("[Device %d] [Remaining Partition] (for COMM) sm count: %d\n", device_id, remaining_partition_device_resource.sm.smCount); fflush(stdout);
+    printf("[Device %d] [Primary Partition] (for Green partition) sm count: %d\n", device_id, primary_partition_device_resource.sm.smCount); fflush(stdout);
+    printf("[Device %d] [Remaining Partition] (for Remain partition) sm count: %d\n", device_id, remaining_partition_device_resource.sm.smCount); fflush(stdout);
     primary_partition_sm_count = primary_partition_device_resource.sm.smCount;
     remaining_partition_sm_count = remaining_partition_device_resource.sm.smCount;
 

@@ -76,7 +76,7 @@ def main():
     q, k, v = setup_data(qo_len=qo_len)
     
     # 测试的SM数量
-    sm_counts = [10, 20, 30, 40, 50, 60, 70, 80]
+    sm_counts = [8, 16, 32, 64, 72, 80, 96, 112, 128, 144, 160, 176, 188]
     
     print("\n测试正常模式...")
     baseline = benchmark_single_prefill(q, k, v, sm_count=None)
