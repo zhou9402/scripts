@@ -6,149 +6,229 @@
 namespace py = pybind11;
 
 // 全局变量存储 Green Context 状态
-static CUgreenCtx g_green_ctx = nullptr;
-static CUcontext g_context = nullptr;
-static CUcontext g_default_context = nullptr;
+static CUcontext g_primary_context = nullptr;
+static CUgreenCtx g_primary_partition_green_ctx = nullptr;
+static CUgreenCtx g_remaining_partition_green_ctx = nullptr;
+static CUstream g_primary_partition_stream = nullptr;
+static CUstream g_remaining_partition_stream = nullptr;
+static int g_primary_partition_sm_count = 0;
+static int g_remaining_partition_sm_count = 0;
 static bool g_initialized = false;
 
-bool create_green_context(int sm_count = 8) {
+// 创建Green Context和Streams (一次性划分SM为primary和remaining)
+std::tuple<uint64_t, uint64_t, int, int> create_green_context_and_streams(
+    int intended_primary_sm_count,
+    int primary_stream_priority = 0,
+    int remaining_stream_priority = 0,
+    int device_id = 0) {
+    
     if (g_initialized) {
-        return true; // 已经初始化
+        throw std::runtime_error("Green Context already initialized. Call destroy first.");
     }
-    
-    // 保存当前的默认context
-    CUresult res = cuCtxGetCurrent(&g_default_context);
-    if (res != CUDA_SUCCESS) {
-        std::cerr << "无法获取当前默认context" << std::endl;
-        return false;
-    }
-    
-    CUdevice device;
-    CUdevResource dev_resource = {};
-    CUdevResource sm_resources[2] = {{}, {}};
-    CUdevResourceDesc desc = nullptr;
-    unsigned int flags = CU_GREEN_CTX_DEFAULT_STREAM;
-    unsigned int split_count = 1;
-    unsigned int min_sm_count = sm_count;
     
     // 初始化 CUDA Driver
-    res = cuInit(0);
+    CUresult res = cuInit(0);
     if (res != CUDA_SUCCESS) {
-        std::cerr << "CUDA初始化失败" << std::endl;
-        return false;
+        throw std::runtime_error("Failed to initialize CUDA driver");
     }
     
     // 获取设备
-    res = cuDeviceGet(&device, 0);
+    CUdevice device;
+    res = cuDeviceGet(&device, device_id);
     if (res != CUDA_SUCCESS) {
-        std::cerr << "获取设备失败" << std::endl;
-        return false;
+        throw std::runtime_error("Failed to get CUDA device");
     }
     
-    // 获取设备的 SM 资源
-    res = cuDeviceGetDevResource(device, &dev_resource, CU_DEV_RESOURCE_TYPE_SM);
+    // 获取primary context
+    res = cuDevicePrimaryCtxRetain(&g_primary_context, device);
     if (res != CUDA_SUCCESS) {
-        std::cerr << "获取设备资源失败" << std::endl;
-        return false;
+        throw std::runtime_error("Failed to retain primary context");
     }
     
-    // 分割 SM 资源
-    res = cuDevSmResourceSplitByCount(&sm_resources[0], &split_count, 
-                                      &dev_resource, &sm_resources[1], 
-                                      0, min_sm_count);
+    // 设置当前context
+    res = cuCtxSetCurrent(g_primary_context);
     if (res != CUDA_SUCCESS) {
-        std::cerr << "分割 SM 资源失败" << std::endl;
-        return false;
+        throw std::runtime_error("Failed to set current context");
     }
     
-    // 生成资源描述符
-    res = cuDevResourceGenerateDesc(&desc, &sm_resources[0], 1);
+    // 1. 获取设备的SM资源
+    CUdevResource device_resource;
+    res = cuDeviceGetDevResource(device, &device_resource, CU_DEV_RESOURCE_TYPE_SM);
     if (res != CUDA_SUCCESS) {
-        std::cerr << "生成资源描述符失败" << std::endl;
-        return false;
+        throw std::runtime_error("Failed to get device SM resource");
     }
     
-    // 创建 Green Context
-    res = cuGreenCtxCreate(&g_green_ctx, desc, device, flags);
-    if (res != CUDA_SUCCESS) {
-        std::cerr << "创建Green Context失败" << std::endl;
-        return false;
+    int total_sm_count = device_resource.sm.smCount;
+    std::cout << "[Green Context] Total SM count: " << total_sm_count << std::endl;
+    
+    if (intended_primary_sm_count > total_sm_count) {
+        throw std::runtime_error("Requested SM count exceeds available SMs");
     }
     
-    // 转换为普通 context
-    res = cuCtxFromGreenCtx(&g_context, g_green_ctx);
+    // 2. 分割SM资源为primary和remaining partitions
+    CUdevResource primary_partition_resource;
+    CUdevResource remaining_partition_resource;
+    unsigned int num_groups = 1;
+    
+    res = cuDevSmResourceSplitByCount(
+        &primary_partition_resource,
+        &num_groups,
+        &device_resource,
+        &remaining_partition_resource,
+        0,  // flags
+        intended_primary_sm_count
+    );
+    
     if (res != CUDA_SUCCESS) {
-        std::cerr << "转换 Green Context 失败" << std::endl;
-        return false;
+        cuDevicePrimaryCtxRelease(device);
+        throw std::runtime_error("Failed to split SM resources");
+    }
+    
+    g_primary_partition_sm_count = primary_partition_resource.sm.smCount;
+    g_remaining_partition_sm_count = remaining_partition_resource.sm.smCount;
+    
+    std::cout << "[Green Context] Primary partition: " << g_primary_partition_sm_count << " SMs" << std::endl;
+    std::cout << "[Green Context] Remaining partition: " << g_remaining_partition_sm_count << " SMs" << std::endl;
+    
+    // 3. 生成资源描述符
+    CUdevResourceDesc primary_partition_desc;
+    CUdevResourceDesc remaining_partition_desc;
+    
+    res = cuDevResourceGenerateDesc(&primary_partition_desc, &primary_partition_resource, 1);
+    if (res != CUDA_SUCCESS) {
+        cuDevicePrimaryCtxRelease(device);
+        throw std::runtime_error("Failed to generate primary partition descriptor");
+    }
+    
+    res = cuDevResourceGenerateDesc(&remaining_partition_desc, &remaining_partition_resource, 1);
+    if (res != CUDA_SUCCESS) {
+        cuDevicePrimaryCtxRelease(device);
+        throw std::runtime_error("Failed to generate remaining partition descriptor");
+    }
+    
+    // 4. 创建Green Contexts
+    unsigned int green_ctx_flags = CU_GREEN_CTX_DEFAULT_STREAM;
+    
+    res = cuGreenCtxCreate(&g_primary_partition_green_ctx, primary_partition_desc, device, green_ctx_flags);
+    if (res != CUDA_SUCCESS) {
+        cuDevicePrimaryCtxRelease(device);
+        throw std::runtime_error("Failed to create primary partition green context");
+    }
+    
+    res = cuGreenCtxCreate(&g_remaining_partition_green_ctx, remaining_partition_desc, device, green_ctx_flags);
+    if (res != CUDA_SUCCESS) {
+        cuGreenCtxDestroy(g_primary_partition_green_ctx);
+        cuDevicePrimaryCtxRelease(device);
+        throw std::runtime_error("Failed to create remaining partition green context");
+    }
+    
+    // 5. 创建Streams
+    unsigned int stream_flags = CU_STREAM_NON_BLOCKING;
+    
+    res = cuGreenCtxStreamCreate(&g_primary_partition_stream, g_primary_partition_green_ctx, 
+                                 stream_flags, primary_stream_priority);
+    if (res != CUDA_SUCCESS) {
+        cuGreenCtxDestroy(g_remaining_partition_green_ctx);
+        cuGreenCtxDestroy(g_primary_partition_green_ctx);
+        cuDevicePrimaryCtxRelease(device);
+        throw std::runtime_error("Failed to create primary partition stream");
+    }
+    
+    res = cuGreenCtxStreamCreate(&g_remaining_partition_stream, g_remaining_partition_green_ctx, 
+                                 stream_flags, remaining_stream_priority);
+    if (res != CUDA_SUCCESS) {
+        cuStreamDestroy(g_primary_partition_stream);
+        cuGreenCtxDestroy(g_remaining_partition_green_ctx);
+        cuGreenCtxDestroy(g_primary_partition_green_ctx);
+        cuDevicePrimaryCtxRelease(device);
+        throw std::runtime_error("Failed to create remaining partition stream");
     }
     
     g_initialized = true;
-    return true;
+    
+    std::cout << "[Green Context] Created successfully!" << std::endl;
+    std::cout << "  Primary stream: 0x" << std::hex << reinterpret_cast<uint64_t>(g_primary_partition_stream) << std::dec << std::endl;
+    std::cout << "  Remaining stream: 0x" << std::hex << reinterpret_cast<uint64_t>(g_remaining_partition_stream) << std::dec << std::endl;
+    
+    // 返回stream handles和SM counts
+    return std::make_tuple(
+        reinterpret_cast<uint64_t>(g_primary_partition_stream),
+        reinterpret_cast<uint64_t>(g_remaining_partition_stream),
+        g_primary_partition_sm_count,
+        g_remaining_partition_sm_count
+    );
 }
 
+// 销毁Green Context
 void destroy_green_context() {
-    if (g_initialized && g_green_ctx) {
-        // 先切换回默认context
-        if (g_default_context) {
-            cuCtxSetCurrent(g_default_context);
-        }
-        cuGreenCtxDestroy(g_green_ctx);
-        g_green_ctx = nullptr;
-        g_context = nullptr;
-        g_default_context = nullptr;
-        g_initialized = false;
+    if (!g_initialized) {
+        return;
     }
+    
+    std::cout << "[Green Context] Destroying..." << std::endl;
+    
+    if (g_remaining_partition_stream) {
+        cuStreamDestroy(g_remaining_partition_stream);
+        g_remaining_partition_stream = nullptr;
+    }
+    
+    if (g_primary_partition_stream) {
+        cuStreamDestroy(g_primary_partition_stream);
+        g_primary_partition_stream = nullptr;
+    }
+    
+    if (g_remaining_partition_green_ctx) {
+        cuGreenCtxDestroy(g_remaining_partition_green_ctx);
+        g_remaining_partition_green_ctx = nullptr;
+    }
+    
+    if (g_primary_partition_green_ctx) {
+        cuGreenCtxDestroy(g_primary_partition_green_ctx);
+        g_primary_partition_green_ctx = nullptr;
+    }
+    
+    if (g_primary_context) {
+        CUdevice device;
+        cuCtxGetDevice(&device);
+        cuDevicePrimaryCtxRelease(device);
+        g_primary_context = nullptr;
+    }
+    
+    g_initialized = false;
+    
+    std::cout << "[Green Context] Destroyed successfully!" << std::endl;
 }
 
-bool switch_to_green_context() {
-    if (!g_initialized || !g_context) {
-        std::cerr << "Green Context未初始化，请先调用create_green_context" << std::endl;
-        return false;
+// 获取SM分配信息
+std::tuple<int, int> get_sm_counts() {
+    if (!g_initialized) {
+        throw std::runtime_error("Green Context not initialized");
     }
-    
-    CUresult res = cuCtxSetCurrent(g_context);
-    if (res != CUDA_SUCCESS) {
-        std::cerr << "切换到Green Context失败" << std::endl;
-        return false;
-    }
-    
-    return true;
+    return std::make_tuple(g_primary_partition_sm_count, g_remaining_partition_sm_count);
 }
 
-bool switch_to_default_context() {
-    if (!g_default_context) {
-        std::cerr << "默认Context不可用" << std::endl;
-        return false;
-    }
-    
-    CUresult res = cuCtxSetCurrent(g_default_context);
-    if (res != CUDA_SUCCESS) {
-        std::cerr << "切换到默认Context失败" << std::endl;
-        return false;
-    }
-    
-    return true;
-}
-
-bool is_green_context_active() {
+// 检查是否已初始化
+bool is_initialized() {
     return g_initialized;
 }
 
 // Python 绑定
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("create_green_context", &create_green_context, 
-          "Create Green Context with limited SM count", 
-          py::arg("sm_count") = 8);
+    m.doc() = "Green Context Library with Primary/Remaining Partition Support";
     
-    m.def("destroy_green_context", &destroy_green_context, 
-          "Destroy Green Context");
+    m.def("create_green_context_and_streams", &create_green_context_and_streams,
+          "Create Green Context with primary and remaining partitions, returns (primary_stream, remaining_stream, primary_sms, remaining_sms)",
+          py::arg("intended_primary_sm_count"),
+          py::arg("primary_stream_priority") = 0,
+          py::arg("remaining_stream_priority") = 0,
+          py::arg("device_id") = 0);
     
-    m.def("switch_to_green_context", &switch_to_green_context, 
-          "Switch to Green Context");
+    m.def("destroy_green_context", &destroy_green_context,
+          "Destroy Green Context and free all resources");
     
-    m.def("switch_to_default_context", &switch_to_default_context, 
-          "Switch to default Context");
+    m.def("get_sm_counts", &get_sm_counts,
+          "Get SM counts for primary and remaining partitions, returns (primary_sms, remaining_sms)");
     
-    m.def("is_green_context_active", &is_green_context_active, 
-          "Check if Green Context is active");
-} 
+    m.def("is_initialized", &is_initialized,
+          "Check if Green Context is initialized");
+}

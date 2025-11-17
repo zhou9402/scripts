@@ -1,10 +1,13 @@
+# GQA Prefill/Decode/Hybrid SM 缩放测试
+
 ## 🚀 Green Context 库编译指南
+
 ### 🛠️ 编译步骤
 
 1. **检查依赖环境**  
    需提前安装 `torch` 和 `pybind11`，可使用如下命令安装：
    ```bash
-   pip install torch pybind11
+   pip install torch pybind11 flashinfer
    ```
 
 2. **执行编译脚本**  
@@ -18,57 +21,435 @@
    编译完成后可在 Python 中直接导入：
    ```python
    import green_context_lib as green_context
+   
+   # 测试API
+   primary_stream, remaining_stream, primary_sms, remaining_sms = \
+       green_context.create_green_context_and_streams(
+           intended_primary_sm_count=64
+       )
+   print(f"Primary: {primary_sms} SMs, Remaining: {remaining_sms} SMs")
+   green_context.destroy_green_context()
    ```
 
----
-
-### 📦 目录结构说明
-
-- `build_library.sh` —— 一键编译脚本
-- `green_context_lib*.so` —— 编译生成的核心库
-- `quick_sm_test.py` —— SM缩放性能测试脚本
-- `hybrid.py` —— Prefill+Decode并发测试脚本
+**⚠️ 重要提示**: 本文档对应的 `green_context_wrapper.cu` 已更新为支持 primary/remaining partition 的新版本。如果之前编译过旧版本，请重新编译：
+```bash
+rm green_context_lib*.so  # 删除旧的.so文件
+bash build_library.sh      # 重新编译
+```
 
 ---
 
-### 🏃‍♂️ 性能测试快速上手
+## 📖 测试脚本说明
 
-**1. SM 缩放性能测试**
+这些测试脚本用于评估 **GQA (Grouped Query Attention)** 在不同 SM 数量限制下的性能表现，包括：
+- **Prefill**: 长序列的初始处理
+- **Decode**: 单token生成  
+- **Hybrid**: Prefill和Decode并发执行
 
-运行不同 SM 数量下的 Prefill 性能测试（默认 `q_len=1`，模拟 GQA 场景）：
+### GQA 配置
+- **Query Heads**: 64
+- **KV Heads**: 8
+- **GQA 比例**: 8:1 (每 8 个 query heads 共享 1 个 KV head)
+- **Head Dimension**: 128
+- **KV Length**: 4096 tokens
+
+---
+
+## 📦 测试脚本详解
+
+### 1. prefill.py - Prefill 性能测试
+
+**用途**: 测试 Prefill 在不同 SM 数量下的性能
+
+**特点**:
+- 批处理 32 个请求
+- Query 长度 4096 tokens
+- **使用 Green Context 的 primary partition 来限制 SM**
+- 自动测试从 8 到最大 SM 的完整范围
+- 动态获取 GPU 的实际 SM 数量
+
+**运行方式**:
+```bash
+python prefill.py
+```
+
+**输出示例**:
+```
+======================================================================
+性能对比结果
+======================================================================
+GPU总SM数: 132
+完整SM基线时间: 8.234 ms
+
+SM数量     占比%        时间(ms)      性能达到%    
+----------------------------------------------------------------------
+132        100.0%       8.234        100.0%      
+8          6.1%         32.456       25.4%       
+16         12.1%        18.234       45.2%       
+32         24.2%        11.234       73.3%       
+...
+```
+
+---
+
+### 2. decode.py - Decode 性能测试
+
+**用途**: 测试 Decode 在不同 SM 数量下的性能
+
+**特点**:
+- 大批处理 128 个请求（decode 通常 batch 更大）
+- 每个序列生成 1 个 token
+- **使用 Green Context 的 primary partition 来限制 SM**
+- 自动测试从 8 到最大 SM 的完整范围
+
+**运行方式**:
+```bash
+python decode.py
+```
+
+**输出示例**:
+```
+======================================================================
+GQA Decode SM 缩放测试
+======================================================================
+配置: Batch=128, KV_len=4096, Query_len=1 (decode)
+GPU总SM数: 132, 测试范围: 8~132 (步长8), 运行10次
+======================================================================
+
+[1/17] 测试完整SM (无限制)...
+  ✓ 完整SM时间: 2.345 ms
+
+性能对比结果:
+SM数量     占比%        时间(ms)      性能达到%    
+----------------------------------------------------------------------
+132        100.0%       2.345        100.0%      
+8          6.1%         8.234        28.5%       
+16         12.1%        4.567        51.4%       
+...
+```
+
+---
+
+### 3. hybrid.py - 并发测试与最优SM分配 ⭐⭐⭐
+
+**用途**: 测试 Prefill 和 Decode 并发执行，**自动找出最优 SM 分配方案**
+
+**Green Context 原理**:
+- **一次性划分 SM**: 使用 Green Context 将 GPU 的 SM 划分为两个partition
+- **Primary Partition**: 分配给 Prefill (高优先级)
+- **Remaining Partition**: 分配给 Decode (正常优先级)
+- **并发执行**: 两个任务在各自的 partition 上独立并发运行
+
+**特点**:
+- **步骤 1**: 在完整 SM 下分别测试 Prefill 和 Decode 的基线性能
+- **步骤 2**: 自动化测试不同的 SM 划分方案
+- 每次测试创建一个 Green Context，划分为 primary 和 remaining
+- Prefill 在 primary partition stream 上执行
+- Decode 在 remaining partition stream 上执行
+- 测量并发执行的总时间
+- **自动找出最优配置并计算加速比**
+- Prefill 使用小 batch (4)，Decode 使用大 batch (128)
+
+**配置** (在代码中修改):
+```python
+PREFILL_BATCH_SIZE = 4      # Prefill batch size
+PREFILL_QO_LEN = 4096       # Prefill query length  
+DECODE_BATCH_SIZE = 128     # Decode batch size
+DECODE_QO_LEN = 1           # Decode query length
+KV_LEN = 4096
+RUNS = 10
+STEP = 8                    # SM 测试步长
+```
+
+**运行方式**:
+```bash
+python hybrid.py
+```
+
+**输出示例**:
+```
+======================================================================
+Hybrid Prefill + Decode SM 分配测试
+======================================================================
+配置:
+  GPU总SM数: 132
+  Prefill: Batch=4, QO_len=4096
+  Decode: Batch=128, QO_len=1
+  KV_len=4096, 运行10次
+======================================================================
+
+步骤 1: 测试完整SM下的基线性能 (顺序执行)
+======================================================================
+说明: 两个任务都在完整SM上独立测试，总时间为两者之和
+
+测试 Prefill (完整SM)...
+测试 Decode (完整SM)...
+
+基线结果 (都在完整SM上独立测试):
+  Prefill 时间: 850.3 ms (10 次运行)
+  Decode 时间: 78.2 ms (100 次运行)
+  ----------------------------------------
+  顺序执行总时间 = 850.3 + 78.2 = 928.5 ms
+======================================================================
+
+步骤 2: 测试不同SM分配方案
+将测试 15 种SM分配方案
+Primary (Prefill) SM范围: 8 到 124
+======================================================================
+
+[1/15] 测试 Primary=8 SMs (Prefill), Remaining=124 SMs (Decode)...
+  创建Green Context (Primary=8 SMs, Remaining=124 SMs)...
+  ✓ Green Context创建成功
+    实际分配: Primary=8 SMs, Remaining=124 SMs
+  开始并发执行...
+  ✓ 总时间=1450.5ms, Prefill=1420.3ms, Decode=138.2ms
+
+[2/15] 测试 Primary=16 SMs (Prefill), Remaining=116 SMs (Decode)...
+  ✓ 总时间=1220.1ms, Prefill=1210.5ms, Decode=115.3ms
+
+[3/15] 测试 Primary=108 SMs (Prefill), Remaining=24 SMs (Decode)...
+  ✓ 总时间=950.3ms, Prefill=930.2ms, Decode=92.5ms
+...
+
+====================================================================================================
+测试结果汇总
+====================================================================================================
+基线 (完整SM顺序执行): 928.5 ms (Prefill=850.3ms + Decode=78.2ms)
+
+Prefill_SM  Decode_SM   Prefill(ms)   Decode(ms)   总时间(ms)    vs基线     标记       
+----------------------------------------------------------------------------------------------------
+8           124         1420.3        138.2        1450.5       0.64x                
+16          116         1210.5        115.3        1220.1       0.76x                
+108         24          930.2         92.5         950.3        0.98x      ★ 最快    
+116         16          1010.5        108.7        1080.5       0.86x                
+...
+====================================================================================================
+
+性能总结:
+  基线 (顺序执行): 928.5 ms
+  最优配置时间: 950.3 ms
+  加速比: 0.98x
+  性能提升: -2.4%
+
+  最优SM分配:
+    Prefill: 108 SMs (81.8%)
+    Decode: 24 SMs (18.2%)
+====================================================================================================
+```
+
+---
+
+## 🏗️ Green Context 架构说明
+
+### 工作原理
+
+Green Context 是 CUDA 提供的 SM 资源划分机制，允许将 GPU 的 SM 划分为多个独立的 partition：
+
+```
+GPU 总SM (例如 132 SMs)
+├── Primary Partition (例如 108 SMs)
+│   ├── Green Context 1
+│   └── Stream 1 (高优先级，运行 Prefill)
+└── Remaining Partition (例如 24 SMs)
+    ├── Green Context 2
+    └── Stream 2 (正常优先级，运行 Decode)
+```
+
+### 关键特点
+
+1. **一次划分**: 调用一次 `create_green_context_and_streams()`，创建两个 partition
+2. **独立资源**: 每个 partition 有独立的 SM 资源和 stream
+3. **并发执行**: 两个 stream 可以真正并发，不会互相抢占 SM
+4. **优先级隔离**: Primary 高优先级，Remaining 正常优先级
+
+### API 使用
+
+```python
+import green_context_lib as green_context
+
+# 创建Green Context，划分SM为primary和remaining
+primary_stream, remaining_stream, primary_sms, remaining_sms = \
+    green_context.create_green_context_and_streams(
+        intended_primary_sm_count=108,  # Primary partition要108个SM
+        primary_stream_priority=-1,      # 高优先级
+        remaining_stream_priority=0       # 正常优先级
+    )
+
+# Prefill在primary stream上执行
+with torch.cuda.stream(torch.cuda.Stream(stream_ptr=primary_stream)):
+    prefill_output = prefill_kernel(...)
+
+# Decode在remaining stream上执行
+with torch.cuda.stream(torch.cuda.Stream(stream_ptr=remaining_stream)):
+    decode_output = decode_kernel(...)
+
+# 等待两个stream完成
+torch.cuda.synchronize()
+
+# 销毁Green Context
+green_context.destroy_green_context()
+```
+
+---
+
+## 📊 性能指标说明
+
+### 单独测试 (prefill.py / decode.py)
+
+- **SM数量**: 使用的SM数量
+- **占比%**: SM数量占GPU总SM的百分比
+- **时间(ms)**: 平均执行时间 (越低越好)
+- **性能达到%**: 达到完整SM性能的百分比 (越高越好)
+  - 计算: (完整SM时间 / 当前时间) × 100%
+  - 例如：用 25% 的 SM 达到 73% 的性能
+
+### Hybrid 测试
+
+- **vs基线**: 相对于顺序执行的加速比
+- **加速比**: 基线时间 / 并发时间
+- **性能提升**: (1 - 并发时间/基线时间) × 100%
+- **★ 最快**: 标记总时间最短的配置
+
+---
+
+## 🎯 使用场景
+
+1. **单阶段性能分析**: 使用 `prefill.py` 或 `decode.py` 了解单个阶段的 SM 需求
+2. **并发系统设计**: 使用 `hybrid.py` 找出最优的 SM 分配策略
+3. **资源规划**: 确定不同工作负载所需的最小 SM 数量
+4. **性能优化**: 找到性价比最优的 SM 分配方案
+5. **Prefill-Decode 分离**: 为两个阶段分配独立的 SM 资源
+
+---
+
+## 📋 三个脚本对比
+
+| 特性 | prefill.py | decode.py | hybrid.py |
+|------|-----------|-----------|-----------|
+| **测试内容** | Prefill 单独测试 | Decode 单独测试 | Prefill+Decode 并发 |
+| **Batch Size** | 32 | 128 | 4 + 128 |
+| **Query Length** | 4096 | 1 | 4096 + 1 |
+| **测试目标** | 单阶段性能 | 单阶段性能 | 最优SM分配 |
+| **SM分配** | 测试不同SM数 | 测试不同SM数 | 自动优化分配 |
+| **输出结果** | 性能达到% | 性能达到% | 最优配置+加速比 |
+| **基线测试** | ✓ | ✓ | ✓ (两阶段) |
+
+---
+
+## 🚀 快速开始
+
+```bash
+# 进入目录
+cd semi-pd
+
+# 1. 测试 Prefill 性能
+python prefill.py
+
+# 2. 测试 Decode 性能
+python decode.py
+
+# 3. 找出最优 SM 分配（推荐）
+python hybrid.py
+```
+
+---
+
+## 📝 示例工作流
+
+1. **了解基线性能**:
    ```bash
-   python quick_sm_test.py
+   python prefill.py  # 了解 prefill 在不同SM下的性能
+   python decode.py   # 了解 decode 在不同SM下的性能
    ```
 
-**2. Prefill + Decode 并发测试 (hybrid.py)**
+2. **优化并发配置**:
+   ```bash
+   python hybrid.py   # 自动找出最优的 SM 分配方案
+   ```
 
-这个脚本用于模拟真实推理场景：一个计算密集的Prefill任务和一个延迟敏感的Decode任务并发执行。
+3. **应用最优配置**:
+   - 根据 hybrid.py 的结果配置生产环境
+   - 为 prefill 和 decode 分配对应数量的 SM
+   - 实现 prefill-decode 并行执行
 
-#### 核心功能
+---
 
-- **并发与顺序模式**: 支持 `concurrent` (多线程并发) 和 `sequential` (单线程顺序) 两种模式。
-- **资源隔离**: Prefill在默认Context下运行，Decode在受限的Green Context下运行。
+## ⚠️ 注意事项
 
-#### 运行示例
+1. **环境要求**:
+   - 确保已正确编译和安装 `green_context_lib`
+   - 确保 FlashInfer 库已安装且版本兼容
+   - PyTorch with CUDA support
 
-- **运行并发测试 (推荐)**:
-  使用30个SM为Decode任务创建Green Context。
-  ```bash
-  python hybrid.py --sm 30
-  ```
+2. **测试环境**:
+   - 建议在无其他 GPU 负载的环境下运行测试以获得准确结果
+   - hybrid 测试需要较长时间（每个配置约2-3秒）
 
-- **运行顺序测试 (作为基线)**:
-  所有任务都在默认Context下顺序执行，用于对比。
-  ```bash
-  python hybrid.py --mode sequential
-  ```
+3. **参数调整**:
+   - 所有配置参数都在代码顶部定义，可以根据需要修改
+   - SM 测试步长 (STEP) 可以调整以获得更细粒度或更快的测试
 
-- **自定义并发测试**:
-  使用20个SM，batch size为64，prefill运行5次。
-  ```bash
-  python hybrid.py --sm 20 --batch_size 64 --runs 5
-  ```
+4. **GPU兼容性**:
+   - 脚本会自动检测GPU的SM总数
+   - 适用于不同型号的GPU（H100: 132-188 SMs, A100: 108 SMs等）
 
-#### 如何分析结果
+---
 
-通过对比 `concurrent` 和 `sequential` 模式的总时间，可以清晰地看到并发执行带来的性能收益。如果 `并发总时间` < `顺序执行总时间`，说明并发执行有效。
+## 📚 其他测试脚本
+
+### quick_sm_test.py - 兼容性测试
+
+早期版本的单序列测试脚本，现在推荐使用 `prefill.py` 和 `decode.py`。
+
+**运行方式**:
+```bash
+python quick_sm_test.py
+```
+
+---
+
+## 🔄 更新日志
+
+- **2025-11-17 v6 (重大更新)**:
+  - **修正 Green Context 使用方式**: 
+    - 重写 `green_context_wrapper.cu`，支持一次性划分 primary 和 remaining partition
+    - 返回两个 stream handles 和实际的 SM 分配数量
+    - API: `create_green_context_and_streams()` 返回 (primary_stream, remaining_stream, primary_sms, remaining_sms)
+  - **重写 hybrid.py**:
+    - 使用新的 Green Context API
+    - 简化代码架构，去掉多进程
+    - 一次划分 SM：Prefill 用 primary partition，Decode 用 remaining partition
+    - 添加完整 SM 下的基线测试
+    - 输出格式更简洁：6列关键数据
+  - **更新 prefill.py 和 decode.py**:
+    - 使用 Green Context 的 primary partition stream 来限制 SM
+    - 不再使用 `switch_to_green_context()` 这种错误的方式
+    - 正确的做法：创建 Green Context 后在 primary stream 上执行
+  - **更新文档**:
+    - 添加 Green Context 架构说明
+    - 添加 API 使用示例
+    - 更新输出示例以反映正确的术语（Primary/Remaining）
+
+- **2025-11-17 v5**:
+  - hybrid.py 添加完整SM下的基线测试
+  - 显示加速比和性能提升百分比
+  - 更新 README.md 文档
+
+- **2025-11-17 v4**: 
+  - 去掉"时间占比%"列，简化输出
+  - 动态获取GPU的实际SM数量
+  - decode.py batch size 改为 128
+  - hybrid.py 重构为自动化测试
+
+---
+
+## 📞 依赖项
+
+```bash
+pip install torch flashinfer pybind11
+```
+
+- PyTorch (with CUDA support)
+- FlashInfer
+- green_context_lib (需要编译)
+- pybind11 (编译时需要)

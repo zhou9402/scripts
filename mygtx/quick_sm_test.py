@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-快速SM缩放测试 - 单次Prefill版本
-测试单次prefill在不同SM数量下的性能
+GQA Prefill SM 缩放测试
+测试 GQA (Grouped Query Attention) prefill 在不同SM数量下的性能
+配置: Q:KV = 1:8 (8个query heads共享1个KV head), KV长度 = 4096
 使用 green_context_simple 库 (从 gtx.cpp 编译)
 """
 
@@ -10,26 +11,32 @@ import flashinfer
 import green_context_simple as gc
 
 def setup_data(qo_len=1):
-    """设置单次prefill测试数据"""
-    kv_len = 4096
-    num_kv_heads = 8
-    num_qo_heads = 64
+    """
+    设置GQA prefill测试数据
+    - GQA比例: 64 query heads : 8 KV heads = 8:1 (每8个query heads共享1个KV head)
+    - KV长度: 4096 (固定)
+    - Query长度: 可变 (测试不同prefill长度)
+    """
+    kv_len = 4096  # 固定KV长度
+    num_kv_heads = 8    # KV heads
+    num_qo_heads = 64   # Query heads (8:1 ratio for GQA)
     head_dim = 128
     
     # KV缓存数据
     k = torch.randn(kv_len, num_kv_heads, head_dim).half().to(0)
     v = torch.randn(kv_len, num_kv_heads, head_dim).half().to(0)
     
-    # Query数据 - 单次prefill格式
+    # Query数据 - prefill格式
     q = torch.randn(qo_len, num_qo_heads, head_dim).half().to(0)
     
-    print(f"数据配置:")
+    print(f"=== GQA Prefill 数据配置 ===")
     print(f"  Query length: {qo_len}")
     print(f"  KV length: {kv_len}")
     print(f"  Query heads: {num_qo_heads}")
     print(f"  KV heads: {num_kv_heads}")
+    print(f"  GQA ratio (Q:KV): {num_qo_heads//num_kv_heads}:1")
     print(f"  Head dim: {head_dim}")
-    print(f"  Total tokens: {qo_len}")
+    print(f"  Total query tokens: {qo_len}")
     
     return q, k, v
 
@@ -129,52 +136,69 @@ def test_standalone_api(sm_count):
         return False
 
 def main():
-    print("=== 单次 Prefill SM 缩放测试 (使用 green_context_simple) ===\n")
+    print("=" * 70)
+    print("GQA Prefill SM 缩放测试")
+    print("=" * 70)
     
     # 检查库版本
     try:
-        print(f"Green Context库版本: {gc.__version__}")
-        print(f"Green Context支持状态: {'支持' if hasattr(gc, 'is_green_context_supported') and gc.is_green_context_supported() else '不支持(使用fallback)'}")
+        print(f"\n库信息:")
+        print(f"  Green Context库版本: {gc.__version__}")
+        print(f"  Green Context支持状态: {'支持' if hasattr(gc, 'is_green_context_supported') and gc.is_green_context_supported() else '不支持(使用fallback)'}")
     except:
-        print("无法获取库信息")
+        print("\n无法获取库信息")
     
     # 固定配置
-    qo_len = 4096
+    qo_len = 4096  # Query长度 (prefill阶段)
     
-    print("\n设置测试数据...")
+    print("\n" + "=" * 70)
     q, k, v = setup_data(qo_len=qo_len)
+    print("=" * 70)
     
+    # 测试的SM数量范围
     sm_counts = [8, 16, 32, 40, 48, 56, 64, 72, 80, 88, 96, 112, 128, 144, 160, 176, 188]
     
     print(f"\n测试SM数量范围: {sm_counts}")
+    print(f"每个配置运行10次取平均值")
     
-    print("\n测试正常模式(无Green Context限制)...")
+    print("\n" + "-" * 70)
+    print("步骤 1/2: 测试基线性能 (无SM限制)")
+    print("-" * 70)
     baseline = benchmark_single_prefill(q, k, v, sm_count=None)
     if baseline is None:
-        print("正常模式测试失败")
+        print("❌ 基线测试失败")
         return
         
-    print(f"正常模式 (无限制): {baseline:.3f} ms")
+    print(f"✓ 基线时间: {baseline:.3f} ms")
+    baseline_tokens_per_ms = qo_len / baseline
+    print(f"✓ 基线吞吐: {baseline_tokens_per_ms:.1f} tokens/ms")
     
-    
-    print(f"\n性能基准测试 - 不同SM数量:")
-    print(f"{'SM数量':<8} {'时间(ms)':<12} {'vs基线':<10} {'吞吐提升':<10} {'实际SM':<10}")
-    print("-" * 60)
+    print("\n" + "-" * 70)
+    print("步骤 2/2: 测试不同SM数量下的性能")
+    print("-" * 70)
+    print(f"{'SM数量':<8} {'时间(ms)':<12} {'相对时间':<12} {'相对吞吐':<12} {'吞吐(tok/ms)':<15}")
+    print("-" * 70)
     
     for sm_count in sm_counts:
-        print(f"测试 {sm_count} SMs...", end="")
+        print(f"测试 {sm_count:3d} SMs...", end="", flush=True)
         time_ms = benchmark_single_prefill(q, k, v, sm_count=sm_count)
         if time_ms:
             ratio = time_ms / baseline
-            throughput_boost = baseline / time_ms
-            print(f"\r{sm_count:<8} {time_ms:<12.3f} {ratio:<10.2f}x {throughput_boost:<10.2f}x")
+            throughput_ratio = baseline / time_ms
+            tokens_per_ms = qo_len / time_ms
+            print(f"\r{sm_count:<8} {time_ms:<12.3f} {ratio:<12.2f}x {throughput_ratio:<12.2f}x {tokens_per_ms:<15.1f}")
         else:
-            print(f"\r{sm_count:<8} {'Failed':<12} {'N/A':<10} {'N/A':<10}")
+            print(f"\r{sm_count:<8} {'Failed':<12} {'N/A':<12} {'N/A':<12} {'N/A':<15}")
     
-    print(f"\n性能总结:")
-    print(f"  Query tokens: {qo_len}")
-    print(f"  Baseline tokens/ms: {qo_len/baseline:.1f}")
+    print("\n" + "=" * 70)
+    print("测试总结")
+    print("=" * 70)
+    print(f"  GQA配置: 64 query heads, 8 KV heads (8:1)")
+    print(f"  Query length: {qo_len} tokens")
+    print(f"  KV length: 4096 tokens")
+    print(f"  基线性能: {baseline:.3f} ms ({baseline_tokens_per_ms:.1f} tokens/ms)")
     print(f"  使用库: green_context_simple (gtx.cpp)")
+    print("=" * 70)
 
 if __name__ == "__main__":
     try:
