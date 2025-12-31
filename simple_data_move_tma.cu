@@ -79,6 +79,17 @@ __device__ __forceinline__ void tma_store_wait() {
     asm volatile("cp.async.bulk.wait_group.read %0;" :: "n"(N) : "memory");
 }
 
+// Flush L2 cache kernel
+__global__ void flush_l2_cache(float* dummy_data, size_t size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    
+    // Access enough memory to flush L2 cache
+    for (size_t i = idx; i < size / sizeof(float); i += stride) {
+        dummy_data[i] = 0.0f;
+    }
+}
+
 
 // A proper TMA bulk copy kernel for Hopper
 __global__ void tma_bulk_copy_kernel(
@@ -152,11 +163,16 @@ int main(int argc, char **argv)
     // Allocate memory
     float *h_src, *h_dst;
     void *d_src, *d_dst;
+    float *d_dummy; // For L2 cache flushing
 
     h_src = (float *)malloc(size);
     h_dst = (float *)malloc(size);
     CUDA_CHECK(cudaMalloc(&d_src, size));
     CUDA_CHECK(cudaMalloc(&d_dst, size));
+    
+    // Allocate dummy buffer for L2 cache flushing (size of L2 cache ~40-80MB for typical GPUs)
+    size_t l2_flush_size = 80 * 1024 * 1024; // 80 MB
+    CUDA_CHECK(cudaMalloc(&d_dummy, l2_flush_size));
 
     // Initialize data
     for (int i = 0; i < N; i++)
@@ -189,13 +205,24 @@ int main(int argc, char **argv)
     
     printf("\nRunning %d TMA tests using smem_size = %zu bytes...\n", num_runs, smem_size);
 
-    // Warm-up run
-    tma_bulk_copy_kernel<<<1, 1, smem_size>>>(d_dst, d_src, N);
-    CUDA_CHECK(cudaDeviceSynchronize());
+    // Warm-up runs
+    const int num_warmup = 5;
+    printf("Warming up with L2 cache flushing...\n");
+    for (int i = 0; i < num_warmup; i++) {
+        flush_l2_cache<<<108, 1024>>>(d_dummy, l2_flush_size);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        tma_bulk_copy_kernel<<<1, 1, smem_size>>>(d_dst, d_src, N);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
 
-    // Test
+    // Test with L2 cache flushing before each run
+    printf("Running measurements with L2 cache flushing...\n");
     for (int i = 0; i < num_runs; i++)
     {
+        // Flush L2 cache before each measurement
+        flush_l2_cache<<<108, 1024>>>(d_dummy, l2_flush_size);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        
         CUDA_CHECK(cudaEventRecord(start));
         tma_bulk_copy_kernel<<<1, 1, smem_size>>>(d_dst, d_src, N);
         CUDA_CHECK(cudaGetLastError());
@@ -224,6 +251,15 @@ int main(int argc, char **argv)
     }
 
     float avg_time = total_time / num_runs;
+    
+    // Calculate standard deviation
+    float variance = 0.0f;
+    for (int i = 0; i < num_runs; i++)
+    {
+        float diff = times[i] - avg_time;
+        variance += diff * diff;
+    }
+    float std_dev = sqrt(variance / num_runs);
 
     // Verify result
     CUDA_CHECK(cudaMemcpy(h_dst, d_dst, size, cudaMemcpyDeviceToHost));
@@ -259,18 +295,29 @@ int main(int argc, char **argv)
         printf("✅ TMA data verification passed! (checked %d elements)\n", min(2 * check_count, N));
     }
 
-    printf("\n=== TMA Results ===\n");
-    printf("Time (ms): Min=%.3f, Avg=%.3f, Max=%.3f\n", min_time, avg_time, max_time);
-
-    double bandwidth = (size * 2 / (avg_time / 1000.0)) / 1e9; // read+write
-    printf("Bandwidth: %.1f GB/s\n", bandwidth);
-    printf("✅ Using Hardware TMA (Tensor Memory Accelerator)\n");
+    // Calculate bandwidth statistics
+    double avg_bandwidth = (size * 2 / (avg_time / 1000.0)) / 1e9; // read+write
+    double min_bandwidth = (size * 2 / (max_time / 1000.0)) / 1e9; // max time = min bandwidth
+    double max_bandwidth = (size * 2 / (min_time / 1000.0)) / 1e9; // min time = max bandwidth
+    
+    printf("\n=== TMA Performance Summary ===\n");
+    printf("Time (ms):\n");
+    printf("  Min:    %.3f\n", min_time);
+    printf("  Max:    %.3f\n", max_time);
+    printf("  Avg:    %.3f ± %.3f\n", avg_time, std_dev);
+    printf("Bandwidth (GB/s):\n");
+    printf("  Min:    %.1f\n", min_bandwidth);
+    printf("  Max:    %.1f\n", max_bandwidth);
+    printf("  Avg:    %.1f\n", avg_bandwidth);
+    printf("Coefficient of Variation: %.2f%%\n", (std_dev / avg_time) * 100.0f);
+    printf("✅ Using Hardware TMA (Tensor Memory Accelerator) with L2 Cache Flushing\n");
 
     // Cleanup
     free(h_src);
     free(h_dst);
     CUDA_CHECK(cudaFree(d_src));
     CUDA_CHECK(cudaFree(d_dst));
+    CUDA_CHECK(cudaFree(d_dummy));
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
 

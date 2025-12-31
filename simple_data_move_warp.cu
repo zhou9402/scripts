@@ -106,12 +106,17 @@ int main(int argc, char** argv) {
     
     printf("Vectorized Data Move Test - Bypass L1 Cache (int4)\n");
     printf("Matrix: %d x %d floats\n", N, cols);
+    printf("Using %d SMs\n", num_sms);
     
     // 分配内存
     size_t size = N * cols * sizeof(float);
-    float *src, *dst;
+    float *src, *dst, *dummy;
     CUDA_CHECK(cudaMalloc(&src, size));
     CUDA_CHECK(cudaMalloc(&dst, size));
+    
+    // Allocate dummy buffer for L2 cache flushing (size of L2 cache ~40-80MB for typical GPUs)
+    size_t l2_flush_size = 80 * 1024 * 1024; // 80 MB
+    CUDA_CHECK(cudaMalloc(&dummy, l2_flush_size));
     
     // 初始化数据
     CUDA_CHECK(cudaMemset(src, 1, size));
@@ -127,20 +132,20 @@ int main(int argc, char** argv) {
     const int num_runs = 20;     // 测量次数
     float times[num_runs];
     
-    printf("Warming up...\n");
+    printf("Warming up with L2 cache flushing...\n");
     // 预热运行
     for (int i = 0; i < num_warmup; i++) {
-        flush_l2_cache<<<1, 1024>>>(src, size);
+        flush_l2_cache<<<108, 1024>>>(dummy, l2_flush_size);
         CUDA_CHECK(cudaDeviceSynchronize());
         row_move_kernel_unrolled_warp_copy<<<num_sms, threads_per_block>>>(src, dst, N, cols);
         CUDA_CHECK(cudaDeviceSynchronize());
     }
     
-    printf("Running %d measurements...\n", num_runs);
+    printf("Running %d measurements with L2 cache flushing...\n", num_runs);
     // 正式测量
     for (int i = 0; i < num_runs; i++) {
         // 每次测量前flush L2缓存
-        flush_l2_cache<<<1, 1024>>>(src, size);
+        flush_l2_cache<<<108, 1024>>>(dummy, l2_flush_size);
         CUDA_CHECK(cudaDeviceSynchronize());
         
         CUDA_CHECK(cudaEventRecord(start));
@@ -188,10 +193,12 @@ int main(int argc, char** argv) {
     printf("  Max:    %.1f\n", max_bandwidth);
     printf("  Avg:    %.1f\n", avg_bandwidth);
     printf("Coefficient of Variation: %.2f%%\n", (std_dev / avg_time) * 100.0f);
+    printf("✅ Using UNROLLED_WARP_COPY with L2 Cache Flushing\n");
     
     // 清理
     CUDA_CHECK(cudaFree(src));
     CUDA_CHECK(cudaFree(dst));
+    CUDA_CHECK(cudaFree(dummy));
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
     

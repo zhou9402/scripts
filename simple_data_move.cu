@@ -3,6 +3,7 @@
 #include <vector>
 #include <chrono>
 #include <cassert>
+#include <cmath>
 
 // 定义内存访问函数
 __device__ __forceinline__ void st_na_global(int4 *ptr, const int4& value) {
@@ -92,38 +93,107 @@ __global__ void row_move_kernel_bypass_l1_vectorized(float* src, float* dst, int
     }
 }
 
-// 性能测试函数
+// Initialize memory with specific pattern
+__global__ void init_memory_pattern(int* data, size_t num_elements, int pattern) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    
+    for (size_t i = idx; i < num_elements; i += stride) {
+        data[i] = pattern;
+    }
+}
+
+// 性能测试函数（带内存初始化）
 template<typename KernelFunc>
 float benchmark_kernel(KernelFunc kernel, float* d_src, float* d_dst, int N, int cols, 
                       int grid_size, int block_size, const char* kernel_name) {
+    const int num_warmup = 5;
+    const int num_iterations = 100;
+    
+    const int SRC_PATTERN = 0xCAFEBABE;  // Source pattern
+    const int DST_PATTERN = 0xBAADF00D;  // Destination pattern
+    
+    int* d_src_int = reinterpret_cast<int*>(d_src);
+    int* d_dst_int = reinterpret_cast<int*>(d_dst);
+    size_t num_elements = N * cols;
+    
+    int init_grid_size = (num_elements + 1023) / 1024;
+    
     // 预热
-    kernel<<<grid_size, block_size>>>(d_src, d_dst, N, cols);
-    cudaDeviceSynchronize();
+    printf("Warming up %s with memory initialization...\n", kernel_name);
+    for (int i = 0; i < num_warmup; i++) {
+        init_memory_pattern<<<init_grid_size, 1024>>>(d_src_int, num_elements, SRC_PATTERN);
+        init_memory_pattern<<<init_grid_size, 1024>>>(d_dst_int, num_elements, DST_PATTERN);
+        cudaDeviceSynchronize();
+        kernel<<<grid_size, block_size>>>(d_src, d_dst, N, cols);
+        cudaDeviceSynchronize();
+    }
     
     // 计时
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
     
-    const int num_iterations = 100;
+    std::vector<float> times(num_iterations);
     
-    cudaEventRecord(start);
+    printf("Running %d measurements with memory initialization (src=0xCAFEBABE, dst=0xBAADF00D)...\n", num_iterations);
     for (int i = 0; i < num_iterations; i++) {
+        // Initialize memory before each measurement
+        init_memory_pattern<<<init_grid_size, 1024>>>(d_src_int, num_elements, SRC_PATTERN);
+        init_memory_pattern<<<init_grid_size, 1024>>>(d_dst_int, num_elements, DST_PATTERN);
+        cudaDeviceSynchronize();
+        
+        cudaEventRecord(start);
         kernel<<<grid_size, block_size>>>(d_src, d_dst, N, cols);
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        
+        cudaEventElapsedTime(&times[i], start, stop);
+        if (i < 10 || i % 10 == 9) {
+            printf("  Run %3d: %.3f ms\n", i + 1, times[i]);
+        }
     }
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
     
-    float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
+    // Calculate statistics
+    float min_time = times[0];
+    float max_time = times[0];
+    float total_time = 0.0f;
+    
+    for (int i = 0; i < num_iterations; i++) {
+        total_time += times[i];
+        if (times[i] < min_time) min_time = times[i];
+        if (times[i] > max_time) max_time = times[i];
+    }
+    
+    float avg_time = total_time / num_iterations;
+    
+    // Calculate standard deviation
+    float variance = 0.0f;
+    for (int i = 0; i < num_iterations; i++) {
+        float diff = times[i] - avg_time;
+        variance += diff * diff;
+    }
+    float std_dev = sqrt(variance / num_iterations);
+    
+    // Calculate bandwidth statistics
+    size_t data_size = N * cols * sizeof(float);
+    double avg_bandwidth = (data_size * 2 / (avg_time * 1e-3)) / 1e9; // GB/s (read + write)
+    double min_bandwidth = (data_size * 2 / (max_time * 1e-3)) / 1e9;
+    double max_bandwidth = (data_size * 2 / (min_time * 1e-3)) / 1e9;
+    
+    printf("\n=== %s Performance Summary ===\n", kernel_name);
+    printf("Time (ms):\n");
+    printf("  Min:    %.3f\n", min_time);
+    printf("  Max:    %.3f\n", max_time);
+    printf("  Avg:    %.3f ± %.3f\n", avg_time, std_dev);
+    printf("Bandwidth (GB/s):\n");
+    printf("  Min:    %.1f\n", min_bandwidth);
+    printf("  Max:    %.1f\n", max_bandwidth);
+    printf("  Avg:    %.1f\n", avg_bandwidth);
+    printf("Coefficient of Variation: %.2f%%\n\n", (std_dev / avg_time) * 100.0f);
     
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
-    
-    float avg_time = milliseconds / num_iterations;
-    float bandwidth = (2.0f * N * cols * sizeof(float)) / (avg_time * 1e-3) / 1e9; // GB/s
-    
-    printf("%s: %.3f ms, %.2f GB/s\n", kernel_name, avg_time, bandwidth);
     
     return avg_time;
 }
@@ -140,7 +210,7 @@ bool verify_result(float* h_src, float* h_dst, int N, int cols) {
 }
 
 int main() {
-    const int N = 1024;      // 行数
+    const int N = 10240;      // 行数
     const int cols = 4096;   // 列数，确保能被4整除
     const size_t size = N * cols * sizeof(float);
     
@@ -167,6 +237,7 @@ int main() {
     
     // 测试不同的内核
     printf("\nBenchmarking kernels:\n");
+    printf("=============================================================================\n\n");
     
     // 简单版本
     benchmark_kernel(row_move_kernel_simple, d_src, d_dst, N, cols, 
@@ -175,10 +246,12 @@ int main() {
     // 验证简单版本结果
     cudaMemcpy(h_dst.data(), d_dst, size, cudaMemcpyDeviceToHost);
     if (verify_result(h_src.data(), h_dst.data(), N, cols)) {
-        printf("Simple kernel: PASSED\n");
+        printf("✅ Simple kernel: PASSED\n\n");
     } else {
-        printf("Simple kernel: FAILED\n");
+        printf("❌ Simple kernel: FAILED\n\n");
     }
+    
+    printf("=============================================================================\n\n");
     
     // 向量化版本
     benchmark_kernel(row_move_kernel_vectorized, d_src, d_dst, N, cols, 
@@ -187,10 +260,12 @@ int main() {
     // 验证向量化版本结果
     cudaMemcpy(h_dst.data(), d_dst, size, cudaMemcpyDeviceToHost);
     if (verify_result(h_src.data(), h_dst.data(), N, cols)) {
-        printf("Vectorized kernel: PASSED\n");
+        printf("✅ Vectorized kernel: PASSED\n\n");
     } else {
-        printf("Vectorized kernel: FAILED\n");
+        printf("❌ Vectorized kernel: FAILED\n\n");
     }
+    
+    printf("=============================================================================\n\n");
     
     // 绕过L1缓存的向量化版本
     benchmark_kernel(row_move_kernel_bypass_l1_vectorized, d_src, d_dst, N, cols, 
@@ -199,14 +274,17 @@ int main() {
     // 验证绕过L1缓存版本结果
     cudaMemcpy(h_dst.data(), d_dst, size, cudaMemcpyDeviceToHost);
     if (verify_result(h_src.data(), h_dst.data(), N, cols)) {
-        printf("Bypass L1 vectorized kernel: PASSED\n");
+        printf("✅ Bypass L1 vectorized kernel: PASSED\n\n");
     } else {
-        printf("Bypass L1 vectorized kernel: FAILED\n");
+        printf("❌ Bypass L1 vectorized kernel: FAILED\n\n");
     }
     
     // 清理内存
     cudaFree(d_src);
     cudaFree(d_dst);
+    
+    printf("=============================================================================\n");
+    printf("All tests completed!\n");
     
     return 0;
 }
