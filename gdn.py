@@ -5,6 +5,9 @@
 """
 Gated Delta Net: Fused chunk_gated_delta_rule_fwd_h and chunk_fwd_o
 
+Layout: (B, T, H, D) - Batch, Time/Sequence, Head, Dimension
+        No reshape needed - kernel directly loads strided data
+
 Algorithm:
   For each chunk:
     delta = U - W @ S^T            # [chunk, d]
@@ -16,17 +19,18 @@ Key optimizations:
 2. Reuse delta: delta is used in both O and S update, compute once
 3. Memory bound: maximize memory requests, use TMA with latency hints
 4. Multi-batch: each block handles one batch independently
+5. Strided load: directly load (B, T, H, D) without reshape
 
 Inputs:
-  S: (batch, d, d) float32 - state matrices (initialized to 0)
-  W: (batch, seq_len, d) float16 - gate weights
-  U: (batch, seq_len, d) float16 - update values
-  Q: (batch, seq_len, d) float16 - queries
-  K: (batch, seq_len, d) float16 - keys
+  S: (batch, num_heads, d, d) float32 - state matrices (initialized to 0)
+  W: (batch, seq_len, num_heads, d) bfloat16 - gate weights
+  U: (batch, seq_len, num_heads, d) bfloat16 - update values
+  Q: (batch, seq_len, num_heads, d) bfloat16 - queries
+  K: (batch, seq_len, num_heads, d) bfloat16 - keys
   
 Outputs:
-  O: (batch, seq_len, d) float16 - output
-  S: (batch, d, d) float32 - updated states (in-place)
+  O: (batch, seq_len, num_heads, d) bfloat16 - output
+  S: (batch, num_heads, d, d) float32 - updated states (in-place)
 """
 
 import argparse
@@ -40,297 +44,366 @@ ConstInt = ct.Constant[int]
 HEAD_DIM = 128    # d
 CHUNK_SIZE = 64   # chunk size for processing
 
+def solve_16x16_block(a_blk, identity_16, dtype):
+    """Compute (I + A)^{-1} for 16x16 strictly lower triangular block via Neumann series.
+    
+    (I + A)^-1 = I - A + A^2 - A^3 + ... (A is already strictly lower triangular)
+    Inputs are fp16, accumulation in fp32.
+    """
+    neg_a = -a_blk  # fp16
+    
+    # (I + A)^-1 = I + (-A) + (-A)^2 + (-A)^3 + ...
+    # Start with I + (-A) in fp32
+    result = ct.astype(identity_16, ct.float32) + ct.astype(neg_a, ct.float32)
+    
+    # p2 = (-A)^2, accumulate in fp32
+    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
+    p2 = ct.mma(neg_a, neg_a, acc)
+    result = result + p2
+    p2_fp16 = ct.astype(p2, dtype)
+    
+    # p3 = (-A)^3
+    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
+    p3 = ct.mma(p2_fp16, neg_a, acc)
+    result = result + p3
+    p3_fp16 = ct.astype(p3, dtype)
+    
+    # p4 = (-A)^4
+    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
+    p4 = ct.mma(p2_fp16, p2_fp16, acc)
+    result = result + p4
+    p4_fp16 = ct.astype(p4, dtype)
+    
+    # p5 = (-A)^5, p6 = (-A)^6, p7 = (-A)^7
+    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
+    result = result + ct.mma(p4_fp16, neg_a, acc)
+    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
+    result = result + ct.mma(p4_fp16, p2_fp16, acc)
+    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
+    result = result + ct.mma(p4_fp16, p3_fp16, acc)
+    
+    # Convert final result to fp16
+    return ct.astype(result, dtype)
+
+
+def solve_tril_64x64(A, identity_16, dtype):
+    """
+    Compute T = (I + A)^{-1} for 64x64 strictly lower triangular A.
+    Uses 16x16 block decomposition and merge.
+    
+    Args:
+        A: 64x64 strictly lower triangular matrix (fp16)
+        identity_16: 16x16 identity matrix (fp16)
+        dtype: output dtype (K.dtype)
+    
+    Returns:
+        T: 64x64 inverse matrix (fp16)
+    """
+    # Extract 16x16 blocks from A
+    a11 = ct.extract(A, index=(0, 0), shape=(16, 16))
+    a22 = ct.extract(A, index=(16, 16), shape=(16, 16))
+    a33 = ct.extract(A, index=(32, 32), shape=(16, 16))
+    a44 = ct.extract(A, index=(48, 48), shape=(16, 16))
+    a21 = ct.extract(A, index=(16, 0), shape=(16, 16))
+    a31 = ct.extract(A, index=(32, 0), shape=(16, 16))
+    a32 = ct.extract(A, index=(32, 16), shape=(16, 16))
+    a41 = ct.extract(A, index=(48, 0), shape=(16, 16))
+    a42 = ct.extract(A, index=(48, 16), shape=(16, 16))
+    a43 = ct.extract(A, index=(48, 32), shape=(16, 16))
+    
+    # Solve diagonal blocks: T_ii = (I + A_ii)^{-1}
+    t11 = solve_16x16_block(a11, identity_16, dtype)
+    t22 = solve_16x16_block(a22, identity_16, dtype)
+    t33 = solve_16x16_block(a33, identity_16, dtype)
+    t44 = solve_16x16_block(a44, identity_16, dtype)
+    
+    t11_fp16 = ct.astype(t11, dtype)
+    t22_fp16 = ct.astype(t22, dtype)
+    t33_fp16 = ct.astype(t33, dtype)
+    t44_fp16 = ct.astype(t44, dtype)
+    
+    # Off-diagonal blocks: T_ij = -T_ii @ (sum_k A_ik @ T_kj)
+    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
+    tmp = ct.mma(a21, t11_fp16, acc)
+    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
+    t21_fp16 = ct.astype(-ct.mma(t22_fp16, ct.astype(tmp, dtype), acc), dtype)
+    
+    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
+    tmp = ct.mma(a32, t22_fp16, acc)
+    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
+    t32_fp16 = ct.astype(-ct.mma(t33_fp16, ct.astype(tmp, dtype), acc), dtype)
+    
+    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
+    tmp = ct.mma(a43, t33_fp16, acc)
+    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
+    t43_fp16 = ct.astype(-ct.mma(t44_fp16, ct.astype(tmp, dtype), acc), dtype)
+    
+    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
+    tmp1 = ct.mma(a31, t11_fp16, acc)
+    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
+    tmp2 = ct.mma(a32, t21_fp16, acc)
+    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
+    t31_fp16 = ct.astype(-ct.mma(t33_fp16, ct.astype(tmp1 + tmp2, dtype), acc), dtype)
+    
+    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
+    tmp1 = ct.mma(a42, t22_fp16, acc)
+    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
+    tmp2 = ct.mma(a43, t32_fp16, acc)
+    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
+    t42_fp16 = ct.astype(-ct.mma(t44_fp16, ct.astype(tmp1 + tmp2, dtype), acc), dtype)
+    
+    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
+    tmp1 = ct.mma(a41, t11_fp16, acc)
+    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
+    tmp2 = ct.mma(a42, t21_fp16, acc)
+    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
+    tmp3 = ct.mma(a43, t31_fp16, acc)
+    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
+    t41_fp16 = ct.astype(-ct.mma(t44_fp16, ct.astype(tmp1 + tmp2 + tmp3, dtype), acc), dtype)
+    
+    # Assemble T (64x64) using cat
+    zero16 = ct.full((16, 16), 0.0, dtype=dtype)
+    row0_a = ct.cat((t11_fp16, zero16), axis=1)
+    row0_b = ct.cat((zero16, zero16), axis=1)
+    row0 = ct.cat((row0_a, row0_b), axis=1)
+    row1_a = ct.cat((t21_fp16, t22_fp16), axis=1)
+    row1_b = ct.cat((zero16, zero16), axis=1)
+    row1 = ct.cat((row1_a, row1_b), axis=1)
+    row2_a = ct.cat((t31_fp16, t32_fp16), axis=1)
+    row2_b = ct.cat((t33_fp16, zero16), axis=1)
+    row2 = ct.cat((row2_a, row2_b), axis=1)
+    row3_a = ct.cat((t41_fp16, t42_fp16), axis=1)
+    row3_b = ct.cat((t43_fp16, t44_fp16), axis=1)
+    row3 = ct.cat((row3_a, row3_b), axis=1)
+    top = ct.cat((row0, row1), axis=0)
+    bottom = ct.cat((row2, row3), axis=0)
+    T = ct.cat((top, bottom), axis=0)
+    
+    return T
+
 
 @ct.kernel
 def gated_delta_net_kernel(
-    S,      # (batch, d, d) float32 - state
-    W,      # (batch, num_chunks, chunk_size, d) float16
-    U,      # (batch, num_chunks, chunk_size, d) float16
-    Q,      # (batch, num_chunks, chunk_size, d) float16
-    K,      # (batch, num_chunks, chunk_size, d) float16
-    O,      # (batch, num_chunks, chunk_size, d) float16
+    S,      # (B, H, d, d) float32 - state
+    T_in,   # (B, T, H, chunk_size) bfloat16 - one vector per timestep
+    V,      # (B, T, H, d) bfloat16 - strided access
+    Q,      # (B, T, H, d) bfloat16 - strided access
+    K,      # (B, T, H, d) bfloat16 - strided access
+    G,      # (B, num_chunks, H, d) bfloat16 - gate values, one vector per chunk
+    O,      # (B, T, H, d) bfloat16 - strided store
     causal_mask,  # (chunk_size, chunk_size) float32 - precomputed lower triangular
     d: ConstInt,           # head_dim = 128
     chunk_size: ConstInt,  # 64 or 128
-    num_chunks: ConstInt   # number of chunks to process
+    num_chunks: ConstInt,  # number of chunks to process
+    num_heads: ConstInt    # H
 ):
     """
-    Fused Gated Delta Rule forward pass.
+    Two-stage GDN kernel: T is precomputed and loaded from global memory.
     
-    Each block processes one batch, iterating through all chunks sequentially.
-    Grid: (batch,)
-    
-    For each chunk c:
-      1. Load W[batch, c], U[batch, c], Q[batch, c], K[batch, c]
-      2. Compute delta = U - W @ S^T
-      3. Compute O[batch, c] = Q @ S^T + mask(Q @ K^T) @ delta
-      4. Update S = S + delta^T @ K
+    Input Layout: V, Q, K, O: (B, T, H, D) - strided load/store
+                  G: (B, num_chunks, H, D) - one gate vector per chunk
+                  T_in: (B, seq_len, H, chunk_size) - one vector per timestep
+    Grid: (B * H,) - one block per (b, h) pair.
     """
-    batch_idx = ct.bid(0)
+    linear_idx = ct.bid(0)
+    b_idx = linear_idx // num_heads
+    h_idx = linear_idx % num_heads
     zero_pad = ct.PaddingMode.ZERO
     
-    # Load initial state S for this batch: (d, d) in float32
-    s = ct.load(S, index=(batch_idx, 0, 0), shape=(1, d, d), padding_mode=zero_pad)
+    s = ct.load(S, index=(b_idx, h_idx, 0, 0), shape=(1, 1, d, d), padding_mode=zero_pad)
     s = ct.reshape(s, (d, d))
-    
-    # Load causal mask: (chunk_size, chunk_size) - shared across batches
     mask = ct.load(causal_mask, index=(0, 0), shape=(chunk_size, chunk_size), padding_mode=zero_pad)
     
-    # Process each chunk
     for c in range(num_chunks):
-        # ============================================================
-        # Step 1: Load current chunk data with TMA and latency hints
-        # ============================================================
-        w = ct.load(W, index=(batch_idx, c, 0, 0), shape=(1, 1, chunk_size, d), 
-                    padding_mode=zero_pad, allow_tma=True, latency=3)
-        w = ct.reshape(w, (chunk_size, d))
+        t_start = c * chunk_size
         
-        u = ct.load(U, index=(batch_idx, c, 0, 0), shape=(1, 1, chunk_size, d), 
-                    padding_mode=zero_pad, allow_tma=True, latency=3)
-        u = ct.reshape(u, (chunk_size, d))
+        # T: (B, seq_len, H, chunk_size) -> load chunk as (chunk_size, chunk_size)
+        T = ct.load(T_in, index=(b_idx, t_start, h_idx, 0), shape=(1, chunk_size, 1, chunk_size), 
+                    padding_mode=zero_pad)
+        T = ct.reshape(T, (chunk_size, chunk_size))  # [chunk_size, chunk_size]
         
-        q = ct.load(Q, index=(batch_idx, c, 0, 0), shape=(1, 1, chunk_size, d), 
-                    padding_mode=zero_pad, allow_tma=True, latency=3)
-        q = ct.reshape(q, (chunk_size, d))
-        
-        k = ct.load(K, index=(batch_idx, c, 0, 0), shape=(1, 1, chunk_size, d), 
-                    padding_mode=zero_pad, allow_tma=True, latency=3)
+        # K: strided (B, T, H, d) -> load (1, chunk_size, 1, d)
+        k = ct.load(K, index=(b_idx, t_start, h_idx, 0), shape=(1, chunk_size, 1, d), 
+                    padding_mode=zero_pad)
         k = ct.reshape(k, (chunk_size, d))
         
-        # ============================================================
-        # Step 2: Convert S to input dtype for MMA (inputs fp16, accumulate fp32)
-        # ============================================================
-        s_fp16 = ct.astype(s, W.dtype)      # [d, d] -> fp16
-        s_t = ct.transpose(s_fp16)           # [d, d] transposed
+        # G: (B, num_chunks, H, d) -> load (1, 1, 1, d) - one gate vector per chunk
+        gate = ct.load(G, index=(b_idx, c, h_idx, 0), shape=(1, 1, 1, d), 
+                       padding_mode=zero_pad)
+        gate = ct.reshape(gate, (1, d))  # [1, d] for broadcast across rows
         
-        # ============================================================
-        # Step 3: Compute delta = U - W @ S^T  [chunk, d]
-        #         This is reused for both O and S update
-        # ============================================================
-        # W @ S^T: [chunk, d] @ [d, d] = [chunk, d], fp16 inputs, fp32 accum
+        # V: strided (B, T, H, d) -> load (1, chunk_size, 1, d)
+        v = ct.load(V, index=(b_idx, t_start, h_idx, 0), shape=(1, chunk_size, 1, d), 
+                    padding_mode=zero_pad)
+        v = ct.reshape(v, (chunk_size, d))
+        
+        # Q: strided (B, T, H, d) -> load (1, chunk_size, 1, d)
+        q = ct.load(Q, index=(b_idx, t_start, h_idx, 0), shape=(1, chunk_size, 1, d), 
+                    padding_mode=zero_pad)
+        q = ct.reshape(q, (chunk_size, d))
+        
+        # W = T @ K, U = T @ V
+        acc = ct.full((chunk_size, d), 0.0, dtype=ct.float32)
+        w = ct.astype(ct.mma(T, k, acc), K.dtype)
+        acc = ct.full((chunk_size, d), 0.0, dtype=ct.float32)
+        u = ct.astype(ct.mma(T, v, acc), K.dtype)
+        
+        # delta = U - W @ S^T
+        s_fp16 = ct.astype(s, K.dtype)
+        s_t = ct.transpose(s_fp16)
         acc_ws = ct.full((chunk_size, d), 0.0, dtype=ct.float32)
         w_st = ct.mma(w, s_t, acc_ws)
-        
-        # delta = U - W @ S^T (in fp32, then convert to fp16 for next MMA)
         u_f32 = ct.astype(u, ct.float32)
-        delta_f32 = u_f32 - w_st  # [chunk, d] in fp32
-        delta = ct.astype(delta_f32, W.dtype)  # [chunk, d] in fp16
+        delta_f32 = u_f32 - w_st
+        delta = ct.astype(delta_f32, K.dtype)
         
-        # ============================================================
-        # Step 4: Compute O = Q @ S^T + mask(Q @ K^T) @ delta
-        #         Uses current S (before update)
-        # ============================================================
-        
-        # Part 1: Q @ S^T  [chunk, d] @ [d, d] = [chunk, d]
+        # O = Q @ S^T + mask(Q @ K^T) @ delta
         acc_qs = ct.full((chunk_size, d), 0.0, dtype=ct.float32)
-        o1 = ct.mma(q, s_t, acc_qs)  # fp16 inputs, fp32 accum
-        
-        # Part 2: mask(Q @ K^T) @ delta
-        # Q @ K^T: [chunk, d] @ [d, chunk] = [chunk, chunk]
-        k_t = ct.transpose(k)  # [d, chunk]
+        o1 = ct.mma(q, s_t, acc_qs)
+        k_t = ct.transpose(k)
         acc_qk = ct.full((chunk_size, chunk_size), 0.0, dtype=ct.float32)
-        qk = ct.mma(q, k_t, acc_qk)  # [chunk, chunk], fp32
-        
-        # Apply causal mask (element-wise multiply with lower triangular mask)
-        qk_masked = qk * mask  # [chunk, chunk], fp32
-        
-        # Convert to fp16 for next MMA
-        qk_masked_fp16 = ct.astype(qk_masked, W.dtype)
-        
-        # qk_masked @ delta: [chunk, chunk] @ [chunk, d] = [chunk, d]
+        qk = ct.mma(q, k_t, acc_qk)
+        qk_masked = qk * mask
+        qk_masked_fp16 = ct.astype(qk_masked, K.dtype)
         acc_o2 = ct.full((chunk_size, d), 0.0, dtype=ct.float32)
-        o2 = ct.mma(qk_masked_fp16, delta, acc_o2)  # fp16 inputs, fp32 accum
-        
-        # O = o1 + o2 (in fp32)
-        o_chunk = o1 + o2  # [chunk, d] in fp32
-        
-        # Store O chunk with TMA
+        o2 = ct.mma(qk_masked_fp16, delta, acc_o2)
+        o_chunk = o1 + o2
         o_out = ct.astype(o_chunk, O.dtype)
-        o_out = ct.reshape(o_out, (1, 1, chunk_size, d))
-        ct.store(O, index=(batch_idx, c, 0, 0), tile=o_out, allow_tma=True)
         
-        # ============================================================
-        # Step 5: Update state S = S + delta^T @ K
-        #         This can overlap with next iteration's loads
-        # ============================================================
-        # delta^T @ K: [d, chunk] @ [chunk, d] = [d, d], fp16 inputs, fp32 accum
-        delta_t = ct.transpose(delta)  # [d, chunk] in fp16
+        # O: strided store (B, T, H, d) -> store (1, chunk_size, 1, d)
+        o_out = ct.reshape(o_out, (1, chunk_size, 1, d))
+        ct.store(O, index=(b_idx, t_start, h_idx, 0), tile=o_out)
+        
+        # S = S * gate + delta^T @ K
+        # gate is (1, d), broadcasts across rows of S
+        delta_t = ct.transpose(delta)
         acc_su = ct.full((d, d), 0.0, dtype=ct.float32)
-        s_update = ct.mma(delta_t, k, acc_su)  # fp16 inputs, fp32 accum
+        s_update = ct.mma(delta_t, k, acc_su)
         
-        # S = S + delta^T @ K
-        s = s + s_update
+        # Element-wise: s * gate, gate (1, d) broadcasts to (d, d)
+        gate_f32 = ct.astype(gate, ct.float32)
+        s = s * gate_f32 + s_update
     
-    # Store final state S for this batch
-    s_out = ct.reshape(s, (1, d, d))
-    ct.store(S, index=(batch_idx, 0, 0), tile=s_out)
+    s_out = ct.reshape(s, (1, 1, d, d))
+    ct.store(S, index=(b_idx, h_idx, 0, 0), tile=s_out)
 
 
 def gated_delta_net_forward(
-    S: torch.Tensor,   # (batch, d, d), float32
-    W: torch.Tensor,   # (batch, seq_len, d), float16
-    U: torch.Tensor,   # (batch, seq_len, d), float16
-    Q: torch.Tensor,   # (batch, seq_len, d), float16
-    K: torch.Tensor,   # (batch, seq_len, d), float16
+    S: torch.Tensor,   # (B, H, d, d), float32
+    T: torch.Tensor,   # (B, seq_len, H, chunk_size), bfloat16
+    G: torch.Tensor,   # (B, num_chunks, H, d), bfloat16 - gate vectors (one per chunk)
+    V: torch.Tensor,   # (B, seq_len, H, d), bfloat16
+    Q: torch.Tensor,   # (B, seq_len, H, d), bfloat16
+    K: torch.Tensor,   # (B, seq_len, H, d), bfloat16
     chunk_size: int = CHUNK_SIZE
 ) -> torch.Tensor:
     """
-    Gated Delta Net forward pass (batched).
+    Gated Delta Net forward pass (batched) with precomputed T and gating.
+    
+    Input Layout: V, Q, K: (B, T, H, D) - strided load, no reshape
+                  G: (B, num_chunks, H, D) - one gate vector per chunk
+                  T: (B, seq_len, H, chunk_size) - one vector per timestep
+    Output Layout: O: (B, T, H, D) - strided store
     
     Args:
-        S: State matrices (batch, d, d), float32, initialized to zeros
-        W: Gate weights (batch, seq_len, d), float16
-        U: Update values (batch, seq_len, d), float16
-        Q: Queries (batch, seq_len, d), float16
-        K: Keys (batch, seq_len, d), float16
+        S: State matrices (B, H, d, d), float32, initialized to zeros
+        T: Precomputed T (B, seq_len, H, chunk_size), bfloat16 - one vector per timestep
+        G: Gate values (B, num_chunks, H, d), bfloat16 - one gate vector per chunk
+        V: Values (B, seq_len, H, d), bfloat16
+        Q: Queries (B, seq_len, H, d), bfloat16
+        K: Keys (B, seq_len, H, d), bfloat16
         chunk_size: Processing chunk size (64 or 128)
     
     Returns:
-        O: Output tensor (batch, seq_len, d), float16
+        O: Output tensor (B, seq_len, H, d), bfloat16
         (S is updated in-place)
     """
-    batch, seq_len, d = W.shape
-    device = W.device
-    
-    assert seq_len % chunk_size == 0, f"seq_len ({seq_len}) must be divisible by chunk_size ({chunk_size})"
-    assert S.shape == (batch, d, d), f"S shape mismatch: expected ({batch}, {d}, {d}), got {S.shape}"
-    assert S.dtype == torch.float32, "S must be float32"
-    
+    B_dim, seq_len, H, d = K.shape
+    device = K.device
     num_chunks = seq_len // chunk_size
     
-    # Reshape inputs for tile indexing: (batch, num_chunks, chunk_size, d)
-    W_reshaped = W.reshape(batch, num_chunks, chunk_size, d).contiguous()
-    U_reshaped = U.reshape(batch, num_chunks, chunk_size, d).contiguous()
-    Q_reshaped = Q.reshape(batch, num_chunks, chunk_size, d).contiguous()
-    K_reshaped = K.reshape(batch, num_chunks, chunk_size, d).contiguous()
+    assert seq_len % chunk_size == 0, f"seq_len ({seq_len}) must be divisible by chunk_size ({chunk_size})"
+    assert S.shape == (B_dim, H, d, d), f"S shape mismatch: expected ({B_dim}, {H}, {d}, {d}), got {S.shape}"
+    assert S.dtype == torch.float32, "S must be float32"
+    assert T.shape == (B_dim, seq_len, H, chunk_size), f"T shape mismatch: expected ({B_dim}, {seq_len}, {H}, {chunk_size}), got {T.shape}"
+    assert G.shape == (B_dim, num_chunks, H, d), f"G shape mismatch: expected ({B_dim}, {num_chunks}, {H}, {d}), got {G.shape}"
     
-    # Output tensor
-    O = torch.empty(batch, num_chunks, chunk_size, d, dtype=W.dtype, device=device)
+    # No reshape needed - kernel uses strided loads/stores
+    # Output tensor: (B, seq_len, H, d)
+    O = torch.empty(B_dim, seq_len, H, d, dtype=K.dtype, device=device)
     
     # Create causal mask (lower triangular) - shared across batches
     causal_mask = torch.tril(torch.ones(chunk_size, chunk_size, dtype=torch.float32, device=device))
     
-    # Launch kernel: one block per batch
-    grid = (batch,)
+    # Launch kernel: one block per (B, H) pair
+    grid = (B_dim * H,)
     
     with torch.cuda.device(device):
         ct.launch(
             torch.cuda.current_stream(), 
             grid, 
             gated_delta_net_kernel,
-            (S, W_reshaped, U_reshaped, Q_reshaped, K_reshaped, O, 
-             causal_mask, d, chunk_size, num_chunks)
+            (S, T, V, Q, K, G, O,
+             causal_mask, d, chunk_size, num_chunks, H)
         )
     
-    # Reshape output back to (batch, seq_len, d)
-    return O.reshape(batch, seq_len, d)
+    return O
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--batch", type=int, default=16)
+    parser.add_argument("--batch", type=int, default=4)
+    parser.add_argument("--heads", type=int, default=32)
     parser.add_argument("--seq-len", type=int, default=256)
-    parser.add_argument("--head-dim", type=int, default=128)
-    parser.add_argument("--chunk-size", type=int, default=64)
+    parser.add_argument("--num-iters", type=int, default=100)
     args = parser.parse_args()
     
-    print("--- Gated Delta Net: Fused chunk_gated_delta_rule_fwd_h + chunk_fwd_o ---")
+    print("--- Fused GDN Benchmark (B, T, H, D) - No Reshape ---")
     
-    batch = args.batch
+    B_dim = args.batch
+    H = args.heads
     seq_len = args.seq_len
-    d = args.head_dim
-    chunk_size = args.chunk_size
+    d = HEAD_DIM
+    chunk_size = CHUNK_SIZE
     device = 'cuda'
+    num_chunks = seq_len // chunk_size
     
-    # Initialize inputs
-    S = torch.zeros(batch, d, d, dtype=torch.float32, device=device)
-    W = torch.randn(batch, seq_len, d, dtype=torch.float16, device=device) * 0.02
-    U = torch.randn(batch, seq_len, d, dtype=torch.float16, device=device) * 0.02
-    Q = torch.randn(batch, seq_len, d, dtype=torch.float16, device=device) * 0.02
-    K = torch.randn(batch, seq_len, d, dtype=torch.float16, device=device) * 0.02
+    # Initialize inputs with shape (B, T, H, D) - no reshape needed
+    S = torch.zeros(B_dim, H, d, d, dtype=torch.float32, device=device)
+    V = torch.randn(B_dim, seq_len, H, d, dtype=torch.bfloat16, device=device) * 0.02
+    Q = torch.randn(B_dim, seq_len, H, d, dtype=torch.bfloat16, device=device) * 0.02
+    K = torch.randn(B_dim, seq_len, H, d, dtype=torch.bfloat16, device=device) * 0.02
+    G = torch.rand(B_dim, num_chunks, H, d, dtype=torch.bfloat16, device=device)  # Gate vectors (0-1), one per chunk
     
-    print(f"Configuration:")
-    print(f"  batch: {batch}")
-    print(f"  seq_len: {seq_len}")
-    print(f"  head_dim: {d}")
-    print(f"  chunk_size: {chunk_size}")
-    print(f"  num_chunks: {seq_len // chunk_size}")
-    print(f"  grid: ({batch},)")
-    print(f"  S: {S.shape}, dtype: {S.dtype}")
-    print(f"  W/U/Q/K: {W.shape}, dtype: {W.dtype}")
+    print(f"B={B_dim}, H={H}, seq={seq_len}, d={d}, chunks={num_chunks}")
+    print(f"Total batch (B*H)={B_dim * H}")
+    
+    # ============================================================
+    # Benchmark: GDN kernel
+    # ============================================================
+    print("\n[GDN Kernel]")
+    
+    # Create dummy T tensor (identity-like for testing): (B, seq_len, H, chunk_size)
+    # Each chunk forms an identity matrix when loaded
+    T = torch.zeros(B_dim, seq_len, H, chunk_size, dtype=torch.bfloat16, device=device)
+    for c in range(num_chunks):
+        for i in range(chunk_size):
+            T[:, c * chunk_size + i, :, i] = 1.0
     
     # Warmup
-    S_warmup = S.clone()
-    O = gated_delta_net_forward(S_warmup, W, U, Q, K, chunk_size)
+    for _ in range(3):
+        O = gated_delta_net_forward(torch.zeros_like(S), T, G, V, Q, K, chunk_size)
     torch.cuda.synchronize()
     
-    print(f"\nOutput O: {O.shape}, dtype: {O.dtype}")
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
     
-    # Timing with CUDA events
-    print("\n--- Performance ---")
-    num_iters = 100
-    
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    
-    start_event.record()
-    for _ in range(num_iters):
-        S_bench = torch.zeros(batch, d, d, dtype=torch.float32, device=device)
-        O = gated_delta_net_forward(S_bench, W, U, Q, K, chunk_size)
-    end_event.record()
+    # Timing
+    start.record()
+    for _ in range(args.num_iters):
+        O = gated_delta_net_forward(torch.zeros_like(S), T, G, V, Q, K, chunk_size)
+    end.record()
     torch.cuda.synchronize()
-    
-    elapsed_ms = start_event.elapsed_time(end_event)
-    avg_ms = elapsed_ms / num_iters
-    
-    # ============================================================
-    # Calculate TFLOPS
-    # ============================================================
-    # Per chunk per batch:
-    #   W @ S^T: 2 * chunk * d * d
-    #   Q @ S^T: 2 * chunk * d * d
-    #   Q @ K^T: 2 * chunk * d * chunk
-    #   mask @ delta: 2 * chunk * chunk * d
-    #   delta^T @ K: 2 * d * chunk * d
-    num_chunks = seq_len // chunk_size
-    flops_per_chunk = (
-        2 * chunk_size * d * d +         # W @ S^T
-        2 * chunk_size * d * d +         # Q @ S^T
-        2 * chunk_size * d * chunk_size + # Q @ K^T
-        2 * chunk_size * chunk_size * d + # qk_masked @ delta
-        2 * d * chunk_size * d           # delta^T @ K
-    )
-    total_flops = batch * num_chunks * flops_per_chunk
-    tflops = total_flops / (avg_ms * 1e-3) / 1e12
-    
-    # ============================================================
-    # Calculate Bandwidth
-    # ============================================================
-    # Per chunk per batch read:
-    #   W: chunk * d * 2 bytes (fp16)
-    #   U: chunk * d * 2 bytes (fp16)
-    #   Q: chunk * d * 2 bytes (fp16)
-    #   K: chunk * d * 2 bytes (fp16)
-    # Per chunk per batch write:
-    #   O: chunk * d * 2 bytes (fp16)
-    # Per batch one-time:
-    #   S read: d * d * 4 bytes (fp32)
-    #   S write: d * d * 4 bytes (fp32)
-    # Shared:
-    #   causal_mask: chunk * chunk * 4 bytes (fp32) - read once, cached
-    
-    bytes_per_chunk = 4 * chunk_size * d * 2 + chunk_size * d * 2  # read W,U,Q,K + write O
-    bytes_per_batch = (
-        num_chunks * bytes_per_chunk +   # per-chunk IO
-        2 * d * d * 4                    # S read + write (fp32)
-    )
-    bytes_total = batch * bytes_per_batch + chunk_size * chunk_size * 4  # + causal_mask
-    bandwidth_gb_s = bytes_total / (avg_ms * 1e-3) / 1e9
-    
-    print(f"Average time: {avg_ms:.3f} ms ({num_iters} iterations)")
-    print(f"TFLOPS: {tflops:.2f}")
-    print(f"Bandwidth: {bandwidth_gb_s:.2f} GB/s")
-    print(f"Data transferred: {bytes_total / 1e6:.2f} MB")
-    
-    print("\n--- Done ---")
+    ms = start.elapsed_time(end) / args.num_iters
+    print(f"  GDN Time: {ms:.3f} ms")
 
