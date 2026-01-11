@@ -3,36 +3,43 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Gated Delta Net: Fused chunk_gated_delta_rule_fwd_h and chunk_fwd_o
+Fused Gated Delta Net: Fuses scale_vk and gdn kernels into a single kernel
 
-Algorithm:
+Layout: (B, T, H, D) - Batch, Time/Sequence, Head, Dimension
+        No reshape needed - kernel directly loads strided data
+
+Algorithm (fully fused):
   For each chunk:
-    delta = U - W @ S^T            # [chunk, d]
-    O     = Q @ S^T + mask(Q @ K^T) @ delta   # [chunk, d], mask is causal (lower triangular)
-    S     = S + delta^T @ K        # [d, d], state update
-
-Key optimizations:
-1. Pipeline: O uses previous S, so O computation can overlap with next chunk's data load
-2. Reuse delta: delta is used in both O and S update, compute once
-3. Memory bound: maximize memory requests, use TMA with latency hints
-4. Multi-batch: each block handles one batch independently
+    # Scale T instead of V/K (mathematically equivalent, more efficient)
+    # T @ (v * beta) = (T * beta^T) @ v
+    # T @ (k * beta * exp(g)) = (T * beta^T * exp(g)^T) @ k
+    T_v = T * beta^T              # [chunk, chunk], scale columns by beta
+    T_k = T_v * exp(g)^T          # [chunk, chunk], scale columns by beta * exp(g)
+    
+    # GDN computation (using original K, V)
+    W = T_k @ K                   # [chunk, d]
+    U = T_v @ V                   # [chunk, d]
+    delta = (U - W @ S^T) * exp(g_last - g)   # [chunk, d], gated delta
+    O = (Q @ S^T) * exp(g) + mask(Q @ K^T * exp(g[:, None] - g[None, :])) @ delta
+    S = S * exp(g_last) + delta^T @ K   # [d, d], state update with decay
 
 Inputs:
-  S: (batch, d, d) float32 - state matrices (initialized to 0)
-  W: (batch, seq_len, d) float16 - gate weights
-  U: (batch, seq_len, d) float16 - update values
-  Q: (batch, seq_len, d) float16 - queries
-  K: (batch, seq_len, d) float16 - keys
+  S: (batch, num_heads, d, d) float32 - state matrices (initialized to 0)
+  T: (batch, seq_len, num_heads, chunk_size) bfloat16 - precomputed T
+  G: (batch, seq_len, num_heads) bfloat16 - gate values
+  Beta: (batch, seq_len, num_heads) bfloat16 - beta values
+  V: (batch, seq_len, num_heads, d) bfloat16 - values
+  Q: (batch, seq_len, num_heads, d) bfloat16 - queries
+  K: (batch, seq_len, num_heads, d) bfloat16 - keys
   
 Outputs:
-  O: (batch, seq_len, d) float16 - output
-  S: (batch, d, d) float32 - updated states (in-place)
+  O: (batch, seq_len, num_heads, d) bfloat16 - output
+  S: (batch, num_heads, d, d) float32 - updated states (in-place)
 """
 
 import argparse
 import cuda.tile as ct
 import torch
-from math import ceil
 
 ConstInt = ct.Constant[int]
 
@@ -40,241 +47,32 @@ ConstInt = ct.Constant[int]
 HEAD_DIM = 128    # d
 CHUNK_SIZE = 64   # chunk size for processing
 
-def solve_16x16_block(a_blk, identity_16, dtype):
-    """Compute (I + A)^{-1} for 16x16 strictly lower triangular block via Neumann series.
-    
-    (I + A)^-1 = I - A + A^2 - A^3 + ... (A is already strictly lower triangular)
-    Inputs are fp16, accumulation in fp32.
-    """
-    neg_a = -a_blk  # fp16
-    
-    # (I + A)^-1 = I + (-A) + (-A)^2 + (-A)^3 + ...
-    # Start with I + (-A) in fp32
-    result = ct.astype(identity_16, ct.float32) + ct.astype(neg_a, ct.float32)
-    
-    # p2 = (-A)^2, accumulate in fp32
-    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
-    p2 = ct.mma(neg_a, neg_a, acc)
-    result = result + p2
-    p2_fp16 = ct.astype(p2, dtype)
-    
-    # p3 = (-A)^3
-    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
-    p3 = ct.mma(p2_fp16, neg_a, acc)
-    result = result + p3
-    p3_fp16 = ct.astype(p3, dtype)
-    
-    # p4 = (-A)^4
-    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
-    p4 = ct.mma(p2_fp16, p2_fp16, acc)
-    result = result + p4
-    p4_fp16 = ct.astype(p4, dtype)
-    
-    # p5 = (-A)^5, p6 = (-A)^6, p7 = (-A)^7
-    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
-    result = result + ct.mma(p4_fp16, neg_a, acc)
-    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
-    result = result + ct.mma(p4_fp16, p2_fp16, acc)
-    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
-    result = result + ct.mma(p4_fp16, p3_fp16, acc)
-    
-    # Convert final result to fp16
-    return ct.astype(result, dtype)
-
-
-def solve_tril_64x64(A, identity_16, dtype):
-    """
-    Compute T = (I + A)^{-1} for 64x64 strictly lower triangular A.
-    Uses 16x16 block decomposition and merge.
-    
-    Args:
-        A: 64x64 strictly lower triangular matrix (fp16)
-        identity_16: 16x16 identity matrix (fp16)
-        dtype: output dtype (K.dtype)
-    
-    Returns:
-        T: 64x64 inverse matrix (fp16)
-    """
-    # Extract 16x16 blocks from A
-    a11 = ct.extract(A, index=(0, 0), shape=(16, 16))
-    a22 = ct.extract(A, index=(16, 16), shape=(16, 16))
-    a33 = ct.extract(A, index=(32, 32), shape=(16, 16))
-    a44 = ct.extract(A, index=(48, 48), shape=(16, 16))
-    a21 = ct.extract(A, index=(16, 0), shape=(16, 16))
-    a31 = ct.extract(A, index=(32, 0), shape=(16, 16))
-    a32 = ct.extract(A, index=(32, 16), shape=(16, 16))
-    a41 = ct.extract(A, index=(48, 0), shape=(16, 16))
-    a42 = ct.extract(A, index=(48, 16), shape=(16, 16))
-    a43 = ct.extract(A, index=(48, 32), shape=(16, 16))
-    
-    # Solve diagonal blocks: T_ii = (I + A_ii)^{-1}
-    t11 = solve_16x16_block(a11, identity_16, dtype)
-    t22 = solve_16x16_block(a22, identity_16, dtype)
-    t33 = solve_16x16_block(a33, identity_16, dtype)
-    t44 = solve_16x16_block(a44, identity_16, dtype)
-    
-    t11_fp16 = ct.astype(t11, dtype)
-    t22_fp16 = ct.astype(t22, dtype)
-    t33_fp16 = ct.astype(t33, dtype)
-    t44_fp16 = ct.astype(t44, dtype)
-    
-    # Off-diagonal blocks: T_ij = -T_ii @ (sum_k A_ik @ T_kj)
-    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
-    tmp = ct.mma(a21, t11_fp16, acc)
-    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
-    t21_fp16 = ct.astype(-ct.mma(t22_fp16, ct.astype(tmp, dtype), acc), dtype)
-    
-    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
-    tmp = ct.mma(a32, t22_fp16, acc)
-    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
-    t32_fp16 = ct.astype(-ct.mma(t33_fp16, ct.astype(tmp, dtype), acc), dtype)
-    
-    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
-    tmp = ct.mma(a43, t33_fp16, acc)
-    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
-    t43_fp16 = ct.astype(-ct.mma(t44_fp16, ct.astype(tmp, dtype), acc), dtype)
-    
-    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
-    tmp1 = ct.mma(a31, t11_fp16, acc)
-    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
-    tmp2 = ct.mma(a32, t21_fp16, acc)
-    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
-    t31_fp16 = ct.astype(-ct.mma(t33_fp16, ct.astype(tmp1 + tmp2, dtype), acc), dtype)
-    
-    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
-    tmp1 = ct.mma(a42, t22_fp16, acc)
-    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
-    tmp2 = ct.mma(a43, t32_fp16, acc)
-    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
-    t42_fp16 = ct.astype(-ct.mma(t44_fp16, ct.astype(tmp1 + tmp2, dtype), acc), dtype)
-    
-    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
-    tmp1 = ct.mma(a41, t11_fp16, acc)
-    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
-    tmp2 = ct.mma(a42, t21_fp16, acc)
-    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
-    tmp3 = ct.mma(a43, t31_fp16, acc)
-    acc = ct.full((16, 16), 0.0, dtype=ct.float32)
-    t41_fp16 = ct.astype(-ct.mma(t44_fp16, ct.astype(tmp1 + tmp2 + tmp3, dtype), acc), dtype)
-    
-    # Assemble T (64x64) using cat
-    zero16 = ct.full((16, 16), 0.0, dtype=dtype)
-    row0_a = ct.cat((t11_fp16, zero16), axis=1)
-    row0_b = ct.cat((zero16, zero16), axis=1)
-    row0 = ct.cat((row0_a, row0_b), axis=1)
-    row1_a = ct.cat((t21_fp16, t22_fp16), axis=1)
-    row1_b = ct.cat((zero16, zero16), axis=1)
-    row1 = ct.cat((row1_a, row1_b), axis=1)
-    row2_a = ct.cat((t31_fp16, t32_fp16), axis=1)
-    row2_b = ct.cat((t33_fp16, zero16), axis=1)
-    row2 = ct.cat((row2_a, row2_b), axis=1)
-    row3_a = ct.cat((t41_fp16, t42_fp16), axis=1)
-    row3_b = ct.cat((t43_fp16, t44_fp16), axis=1)
-    row3 = ct.cat((row3_a, row3_b), axis=1)
-    top = ct.cat((row0, row1), axis=0)
-    bottom = ct.cat((row2, row3), axis=0)
-    T = ct.cat((top, bottom), axis=0)
-    
-    return T
-
 
 @ct.kernel
-def compute_T_kernel(
-    K,      # (B, H, num_chunks, chunk_size, d) float16
-    B,      # (B, H, num_chunks, chunk_size) float16 - beta values
-    T_out,  # (B, H, num_chunks, chunk_size, chunk_size) float16 - output
-    d: ConstInt,
-    chunk_size: ConstInt,
-    num_chunks: ConstInt,
-    num_heads: ConstInt
-):
-    """
-    Compute T = (I + A)^{-1} for all chunks in parallel.
-    
-    Grid: (B * H * num_chunks,)
-    Each block computes one (b, h, chunk) tuple.
-    
-    Steps:
-      1. Load K chunk, load beta chunk
-      2. A = (K * diag(beta)) @ K^T, take strictly lower triangular
-      3. T = (I + A)^{-1}
-      4. Store T
-    """
-    linear_idx = ct.bid(0)
-    # Decompose linear_idx into (b_idx, h_idx, chunk_idx)
-    bh_idx = linear_idx // num_chunks
-    chunk_idx = linear_idx % num_chunks
-    b_idx = bh_idx // num_heads
-    h_idx = bh_idx % num_heads
-    zero_pad = ct.PaddingMode.ZERO
-    
-    # 16x16 identity for solve (fp16)
-    idx16 = ct.arange(16, dtype=ct.int32)
-    r16 = ct.reshape(idx16, (16, 1))
-    c16 = ct.reshape(idx16, (1, 16))
-    identity_16 = ct.where(r16 == c16, ct.full((16, 16), 1.0, dtype=K.dtype),
-                          ct.full((16, 16), 0.0, dtype=K.dtype))
-    
-    # 64x64 strictly lower triangular mask
-    idx64 = ct.arange(chunk_size, dtype=ct.int32)
-    r64 = ct.reshape(idx64, (chunk_size, 1))
-    c64 = ct.reshape(idx64, (1, chunk_size))
-    
-    # ============================================================
-    # Step 1: Load K and Beta for this chunk
-    # ============================================================
-    k = ct.load(K, index=(b_idx, h_idx, chunk_idx, 0, 0), shape=(1, 1, 1, chunk_size, d), 
-                padding_mode=zero_pad, allow_tma=True)
-    k = ct.reshape(k, (chunk_size, d))  # [chunk_size, d]
-    
-    beta = ct.load(B, index=(b_idx, h_idx, chunk_idx, 0), shape=(1, 1, 1, chunk_size), 
-                   padding_mode=zero_pad, allow_tma=True)
-    beta = ct.reshape(beta, (chunk_size, 1))  # [chunk_size, 1] for broadcasting
-    
-    # ============================================================
-    # Step 2: A = (K * diag(beta)) @ K^T, strictly lower triangular
-    # ============================================================
-    # K * diag(beta) = K * beta (broadcast along d dimension)
-    k_beta = k * beta  # [chunk_size, d], element-wise: each row scaled by its beta
-    
-    # A = k_beta @ K^T: [chunk, d] @ [d, chunk] = [chunk, chunk]
-    k_t = ct.transpose(k)
-    acc_kkt = ct.full((chunk_size, chunk_size), 0.0, dtype=ct.float32)
-    A_full = ct.mma(k_beta, k_t, acc_kkt)
-    
-    # Convert to fp16 first, then take strictly lower triangular
-    A_fp16 = ct.astype(A_full, K.dtype)
-    A_tile = ct.where(r64 > c64, A_fp16, ct.full((chunk_size, chunk_size), 0.0, dtype=K.dtype))
-    
-    # ============================================================
-    # Step 3: Solve T = (I + A)^{-1}
-    # ============================================================
-    T = solve_tril_64x64(A_tile, identity_16, K.dtype)
-    
-    # ============================================================
-    # Step 4: Store T
-    # ============================================================
-    T_reshaped = ct.reshape(T, (1, 1, 1, chunk_size, chunk_size))
-    ct.store(T_out, index=(b_idx, h_idx, chunk_idx, 0, 0), tile=T_reshaped, allow_tma=True)
-
-
-@ct.kernel
-def gated_delta_net_kernel(
+def fused_gdn_kernel(
     S,      # (B, H, d, d) float32 - state
-    T_in,   # (B, H, num_chunks, chunk_size, chunk_size) float16 - precomputed T
-    V,      # (B, H, num_chunks, chunk_size, d) float16
-    Q,      # (B, H, num_chunks, chunk_size, d) float16
-    K,      # (B, H, num_chunks, chunk_size, d) float16
-    G,      # (B, H, num_chunks) float16 - gate values (one scalar per chunk)
-    O,      # (B, H, num_chunks, chunk_size, d) float16
-    causal_mask,  # (chunk_size, chunk_size) float32 - precomputed lower triangular
+    T_in,   # (B, T, H, chunk_size) bfloat16 - precomputed T matrix
+    V,      # (B, T, H, d) bfloat16 - values (not pre-scaled)
+    Q,      # (B, T, H, d) bfloat16 - queries
+    K,      # (B, T, H, d) bfloat16 - keys (not pre-scaled)
+    G,      # (B, T, H) bfloat16 - gate values
+    Beta,   # (B, T, H) bfloat16 - beta values
+    O,      # (B, T, H, d) bfloat16 - output
     d: ConstInt,           # head_dim = 128
     chunk_size: ConstInt,  # 64 or 128
     num_chunks: ConstInt,  # number of chunks to process
-    num_heads: ConstInt    # H
+    num_heads: ConstInt,   # H
+    seq_len: ConstInt      # T
 ):
     """
-    Two-stage GDN kernel: T is precomputed and loaded from global memory.
+    Fully fused GDN kernel: combines scale_vk and gdn into single kernel.
+    
+    For each chunk:
+      1. Load V, K, Q, G, Beta for chunk
+      2. Compute v_scaled = v * beta, k_scaled = k * beta * exp(g) on-the-fly
+      3. Compute W = T @ k_scaled, U = T @ v_scaled
+      4. Compute delta, O, and update S
+    
     Grid: (B * H,) - one block per (b, h) pair.
     """
     linear_idx = ct.bid(0)
@@ -282,339 +80,199 @@ def gated_delta_net_kernel(
     h_idx = linear_idx % num_heads
     zero_pad = ct.PaddingMode.ZERO
     
+    # Load initial state S
     s = ct.load(S, index=(b_idx, h_idx, 0, 0), shape=(1, 1, d, d), padding_mode=zero_pad)
     s = ct.reshape(s, (d, d))
-    mask = ct.load(causal_mask, index=(0, 0), shape=(chunk_size, chunk_size), padding_mode=zero_pad)
+    
+    # Create causal mask (lower triangular) inside kernel
+    offs_row = ct.arange(chunk_size, dtype=ct.int32)[:, None]  # [chunk_size, 1]
+    offs_col = ct.arange(chunk_size, dtype=ct.int32)[None, :]  # [1, chunk_size]
+    mask = ct.where(offs_row >= offs_col, 1.0, 0.0)  # [chunk_size, chunk_size] float32
     
     for c in range(num_chunks):
-        T = ct.load(T_in, index=(b_idx, h_idx, c, 0, 0), shape=(1, 1, 1, chunk_size, chunk_size), 
-                    padding_mode=zero_pad, allow_tma=True, latency=3)
+        t_start = c * chunk_size
+        
+        # Compute actual chunk end (handle last chunk if not divisible)
+        t_end = min(t_start + chunk_size, seq_len)
+        
+        # ============================================================
+        # Load raw inputs for this chunk
+        # ============================================================
+        
+        # T: (B, seq_len, H, chunk_size) -> (chunk_size, chunk_size)
+        T = ct.load(T_in, index=(b_idx, t_start, h_idx, 0), shape=(1, chunk_size, 1, chunk_size), 
+                    padding_mode=zero_pad)
         T = ct.reshape(T, (chunk_size, chunk_size))
         
-        k = ct.load(K, index=(b_idx, h_idx, c, 0, 0), shape=(1, 1, 1, chunk_size, d), 
-                    padding_mode=zero_pad, allow_tma=True, latency=3)
+        # K: (B, T, H, d) -> (chunk_size, d)
+        k = ct.load(K, index=(b_idx, t_start, h_idx, 0), shape=(1, chunk_size, 1, d), 
+                    padding_mode=zero_pad)
         k = ct.reshape(k, (chunk_size, d))
         
-        gate = ct.load(G, index=(b_idx, h_idx, c), shape=(1, 1, 1), padding_mode=zero_pad)
-        gate = ct.reshape(gate, (1, 1))
-        
-        v = ct.load(V, index=(b_idx, h_idx, c, 0, 0), shape=(1, 1, 1, chunk_size, d), 
-                    padding_mode=zero_pad, allow_tma=True, latency=3)
+        # V: (B, T, H, d) -> (chunk_size, d)
+        v = ct.load(V, index=(b_idx, t_start, h_idx, 0), shape=(1, chunk_size, 1, d), 
+                    padding_mode=zero_pad)
         v = ct.reshape(v, (chunk_size, d))
         
-        q = ct.load(Q, index=(b_idx, h_idx, c, 0, 0), shape=(1, 1, 1, chunk_size, d), 
-                    padding_mode=zero_pad, allow_tma=True, latency=3)
+        # Q: (B, T, H, d) -> (chunk_size, d)
+        q = ct.load(Q, index=(b_idx, t_start, h_idx, 0), shape=(1, chunk_size, 1, d), 
+                    padding_mode=zero_pad)
         q = ct.reshape(q, (chunk_size, d))
         
-        # W = T @ K, U = T @ V
-        acc = ct.full((chunk_size, d), 0.0, dtype=ct.float32)
-        w = ct.astype(ct.mma(T, k, acc), K.dtype)
-        acc = ct.full((chunk_size, d), 0.0, dtype=ct.float32)
-        u = ct.astype(ct.mma(T, v, acc), K.dtype)
+        # G: (B, T, H) -> (chunk_size, 1)
+        g_raw = ct.load(G, index=(b_idx, t_start, h_idx), shape=(1, chunk_size, 1), 
+                        padding_mode=zero_pad)
+        g_raw = ct.reshape(g_raw, (chunk_size, 1))
         
-        # delta = U - W @ S^T
+        # Beta: (B, T, H) -> (1, chunk_size) for column-wise scaling of T
+        beta = ct.load(Beta, index=(b_idx, t_start, h_idx), shape=(1, chunk_size, 1), 
+                       padding_mode=zero_pad)
+        beta = ct.reshape(beta, (1, chunk_size))
+        
+        # Get last g value in chunk for state gating
+        g_chunk_last = ct.load(G, index=(b_idx, t_end - 1, h_idx), shape=(1, 1, 1), 
+                               padding_mode=zero_pad)
+        g_chunk_last = ct.reshape(g_chunk_last, (1, 1))
+        
+        # ============================================================
+        # Compute gating factors (all in bfloat16)
+        # ============================================================
+        
+        # exp(g) for T_k scaling
+        exp_g = ct.exp(g_raw)  # [chunk_size, 1] bfloat16
+        
+        # g_chunk = exp(g_chunk_last - g_raw) for delta scaling
+        g_chunk = ct.exp(g_chunk_last - g_raw)  # [chunk_size, 1]
+        
+        # g_chunk_last_exp = exp(g_chunk_last) for state decay
+        g_chunk_last_exp = ct.exp(g_chunk_last)  # [1, 1] scalar
+        
+        # g_attn_matrix = exp(g_raw[:, None] - g_raw[None, :]) for attention
+        g_raw_t = ct.transpose(g_raw)  # [1, chunk_size]
+        g_attn_matrix = ct.exp(g_raw - g_raw_t)  # [chunk_size, chunk_size]
+        
+        # g_out = exp(g_raw) for output scaling (same as exp_g)
+        g_out = exp_g  # [chunk_size, 1]
+        
+        # ============================================================
+        # Scale T instead of V and K (mathematically equivalent, more efficient)
+        # T @ (v * beta) = (T * beta) @ v  (beta is 1 x chunk_size, broadcasts to columns)
+        # T @ (k * beta * exp(g)) = (T * beta * exp(g)^T) @ k
+        # ============================================================
+        
+        # Transpose exp_g for column-wise scaling of T
+        exp_g_t = ct.transpose(exp_g)  # [1, chunk_size]
+        
+        # T_v = T * beta (scale columns by beta, beta is already [1, chunk_size])
+        T_v = T * beta  # [chunk_size, chunk_size] bfloat16
+        
+        # T_k = T_v * exp(g)^T = T * beta * exp(g)^T (scale columns by beta * exp(g))
+        T_k = T_v * exp_g_t  # [chunk_size, chunk_size] bfloat16
+        
+        # ============================================================
+        # Compute W = T_k @ K, U = T_v @ V (using original K, V)
+        # ============================================================
+        acc = ct.full((chunk_size, d), 0.0, dtype=ct.float32)
+        u = ct.astype(ct.mma(T_v, v, acc), K.dtype)
+        
+        acc = ct.full((chunk_size, d), 0.0, dtype=ct.float32)
+        w = ct.astype(ct.mma(T_k, k, acc), K.dtype)
+        
+        # ============================================================
+        # Compute delta = (U - W @ S^T) * g_chunk
+        # ============================================================
+        
         s_fp16 = ct.astype(s, K.dtype)
         s_t = ct.transpose(s_fp16)
-        acc_ws = ct.full((chunk_size, d), 0.0, dtype=ct.float32)
-        w_st = ct.mma(w, s_t, acc_ws)
-        u_f32 = ct.astype(u, ct.float32)
-        delta_f32 = u_f32 - w_st
-        delta = ct.astype(delta_f32, K.dtype)
         
-        # O = Q @ S^T + mask(Q @ K^T) @ delta
+        acc_ws = ct.full((chunk_size, d), 0.0, dtype=ct.float32)
+        w_st = ct.astype(ct.mma(w, s_t, acc_ws), K.dtype)  # bfloat16
+        
+        delta = (u - w_st) * g_chunk  # bfloat16
+        
+        # ============================================================
+        # Compute O = Q @ S^T * exp(g) + mask(Q @ K^T * g_attn_matrix) @ delta
+        # ============================================================
+        
+        # o1 = Q @ S^T * exp(g_raw)
         acc_qs = ct.full((chunk_size, d), 0.0, dtype=ct.float32)
         o1 = ct.mma(q, s_t, acc_qs)
+        o1 = o1 * g_out  # Apply output gate
+        
+        # o2 = mask(Q @ K^T * g_attn_matrix) @ delta
         k_t = ct.transpose(k)
         acc_qk = ct.full((chunk_size, chunk_size), 0.0, dtype=ct.float32)
         qk = ct.mma(q, k_t, acc_qk)
-        qk_masked = qk * mask
+        qk = qk * g_attn_matrix  # Apply attention gate
+        qk_masked = qk * mask  # Apply causal mask
         qk_masked_fp16 = ct.astype(qk_masked, K.dtype)
+        
         acc_o2 = ct.full((chunk_size, d), 0.0, dtype=ct.float32)
         o2 = ct.mma(qk_masked_fp16, delta, acc_o2)
+        
         o_chunk = o1 + o2
         o_out = ct.astype(o_chunk, O.dtype)
-        o_out = ct.reshape(o_out, (1, 1, 1, chunk_size, d))
-        ct.store(O, index=(b_idx, h_idx, c, 0, 0), tile=o_out, allow_tma=True)
         
-        # S = S * gate + delta^T @ K
+        # Store O
+        o_out = ct.reshape(o_out, (1, chunk_size, 1, d))
+        ct.store(O, index=(b_idx, t_start, h_idx, 0), tile=o_out)
+        
+        # ============================================================
+        # Update S = S * exp(g_chunk_last) + delta^T @ K
+        # ============================================================
+        
         delta_t = ct.transpose(delta)
         acc_su = ct.full((d, d), 0.0, dtype=ct.float32)
         s_update = ct.mma(delta_t, k, acc_su)
-        gate_f32 = ct.astype(gate, ct.float32)
-        s = s * gate_f32 + s_update
+        
+        s = s * g_chunk_last_exp + s_update
     
+    # Store final state
     s_out = ct.reshape(s, (1, 1, d, d))
     ct.store(S, index=(b_idx, h_idx, 0, 0), tile=s_out)
 
 
-@ct.kernel
-def fused_gdn_kernel(
-    S,      # (B, H, d, d) float32 - state
-    B,      # (B, H, num_chunks, chunk_size) float16 - beta values for T computation
-    V,      # (B, H, num_chunks, chunk_size, d) float16
-    Q,      # (B, H, num_chunks, chunk_size, d) float16
-    K,      # (B, H, num_chunks, chunk_size, d) float16
-    G,      # (B, H, num_chunks) float16 - gate values (one scalar per chunk)
-    O,      # (B, H, num_chunks, chunk_size, d) float16
-    causal_mask,  # (chunk_size, chunk_size) float32 - precomputed lower triangular
-    d: ConstInt,           # head_dim = 128
-    chunk_size: ConstInt,  # 64 or 128
-    num_chunks: ConstInt,  # number of chunks to process
-    num_heads: ConstInt    # H
-):
-    """
-    Fully fused Gated Delta Rule forward pass.
-    T = (I + A)^{-1} is computed on-the-fly, not stored to global memory.
-    
-    Each block processes one (b, h) pair, iterating through all chunks sequentially.
-    Grid: (B * H,)
-    
-    For each chunk c:
-      1. Load K, V, Q, Beta, gate
-      2. Compute A = (K * diag(beta)) @ K^T, strictly lower triangular
-      3. Compute T = (I + A)^{-1} via 16x16 block method
-      4. Compute W = T @ K, U = T @ V
-      5. Compute delta = U - W @ S^T
-      6. Compute O[b, h, c] = Q @ S^T + mask(Q @ K^T) @ delta
-      7. Update S = S * gate + delta^T @ K
-    """
-    linear_idx = ct.bid(0)
-    b_idx = linear_idx // num_heads
-    h_idx = linear_idx % num_heads
-    zero_pad = ct.PaddingMode.ZERO
-    
-    # 16x16 identity for solve (fp16)
-    idx16 = ct.arange(16, dtype=ct.int32)
-    r16 = ct.reshape(idx16, (16, 1))
-    c16 = ct.reshape(idx16, (1, 16))
-    identity_16 = ct.where(r16 == c16, ct.full((16, 16), 1.0, dtype=ct.float16),
-                          ct.full((16, 16), 0.0, dtype=ct.float16))
-    
-    # 64x64 strictly lower triangular mask
-    idx64 = ct.arange(chunk_size, dtype=ct.int32)
-    r64 = ct.reshape(idx64, (chunk_size, 1))
-    c64 = ct.reshape(idx64, (1, chunk_size))
-    
-    # Load initial state S for this (b, h): (d, d) in float32
-    s = ct.load(S, index=(b_idx, h_idx, 0, 0), shape=(1, 1, d, d), padding_mode=zero_pad)
-    s = ct.reshape(s, (d, d))
-    
-    # Load causal mask: (chunk_size, chunk_size) - shared across batches
-    mask = ct.load(causal_mask, index=(0, 0), shape=(chunk_size, chunk_size), padding_mode=zero_pad)
-    
-    # Process each chunk
-    for c in range(num_chunks):
-        # ============================================================
-        # Step 1: Load K, V, Q, Beta, gate
-        # ============================================================
-        k = ct.load(K, index=(b_idx, h_idx, c, 0, 0), shape=(1, 1, 1, chunk_size, d), 
-                    padding_mode=zero_pad, allow_tma=True, latency=3)
-        k = ct.reshape(k, (chunk_size, d))
-        
-        beta = ct.load(B, index=(b_idx, h_idx, c, 0), shape=(1, 1, 1, chunk_size), 
-                       padding_mode=zero_pad, allow_tma=True)
-        beta = ct.reshape(beta, (chunk_size, 1))
-        
-        gate = ct.load(G, index=(b_idx, h_idx, c), shape=(1, 1, 1), padding_mode=zero_pad)
-        gate = ct.reshape(gate, (1, 1))
-        
-        v = ct.load(V, index=(b_idx, h_idx, c, 0, 0), shape=(1, 1, 1, chunk_size, d), 
-                    padding_mode=zero_pad, allow_tma=True, latency=3)
-        v = ct.reshape(v, (chunk_size, d))
-        
-        q = ct.load(Q, index=(b_idx, h_idx, c, 0, 0), shape=(1, 1, 1, chunk_size, d), 
-                    padding_mode=zero_pad, allow_tma=True, latency=3)
-        q = ct.reshape(q, (chunk_size, d))
-        
-        # ============================================================
-        # Step 2: Compute A = (K * diag(beta)) @ K^T, strictly lower triangular
-        # ============================================================
-        k_beta = k * beta
-        k_t = ct.transpose(k)
-        acc_kkt = ct.full((chunk_size, chunk_size), 0.0, dtype=ct.float32)
-        A_full = ct.mma(k_beta, k_t, acc_kkt)
-        A_fp16 = ct.astype(A_full, K.dtype)
-        A = ct.where(r64 > c64, A_fp16, ct.full((chunk_size, chunk_size), 0.0, dtype=K.dtype))
-        
-        # ============================================================
-        # Step 3: Solve T = (I + A)^{-1}
-        # ============================================================
-        T = solve_tril_64x64(A, identity_16, K.dtype)
-        
-        # ============================================================
-        # Step 4: Compute W = T @ K, U = T @ V
-        # ============================================================
-        acc = ct.full((chunk_size, d), 0.0, dtype=ct.float32)
-        w = ct.astype(ct.mma(T, k, acc), K.dtype)
-        
-        acc = ct.full((chunk_size, d), 0.0, dtype=ct.float32)
-        u = ct.astype(ct.mma(T, v, acc), K.dtype)
-        
-        # ============================================================
-        # Step 5: Convert S to input dtype for MMA (inputs fp16, accumulate fp32)
-        # ============================================================
-        s_fp16 = ct.astype(s, K.dtype)      # [d, d] -> fp16
-        s_t = ct.transpose(s_fp16)           # [d, d] transposed
-        
-        # ============================================================
-        # Step 6: Compute delta = U - W @ S^T  [chunk, d]
-        #         This is reused for both O and S update
-        # ============================================================
-        # W @ S^T: [chunk, d] @ [d, d] = [chunk, d], fp16 inputs, fp32 accum
-        acc_ws = ct.full((chunk_size, d), 0.0, dtype=ct.float32)
-        w_st = ct.mma(w, s_t, acc_ws)
-        
-        # delta = U - W @ S^T (in fp32, then convert to fp16 for next MMA)
-        u_f32 = ct.astype(u, ct.float32)
-        delta_f32 = u_f32 - w_st  # [chunk, d] in fp32
-        delta = ct.astype(delta_f32, K.dtype)  # [chunk, d] in fp16
-        
-        # ============================================================
-        # Step 5: Compute O = Q @ S^T + mask(Q @ K^T) @ delta
-        #         Uses current S (before update)
-        # ============================================================
-        
-        # Part 1: Q @ S^T  [chunk, d] @ [d, d] = [chunk, d]
-        acc_qs = ct.full((chunk_size, d), 0.0, dtype=ct.float32)
-        o1 = ct.mma(q, s_t, acc_qs)  # fp16 inputs, fp32 accum
-        
-        # Part 2: mask(Q @ K^T) @ delta
-        # Q @ K^T: [chunk, d] @ [d, chunk] = [chunk, chunk]
-        k_t = ct.transpose(k)  # [d, chunk]
-        acc_qk = ct.full((chunk_size, chunk_size), 0.0, dtype=ct.float32)
-        qk = ct.mma(q, k_t, acc_qk)  # [chunk, chunk], fp32
-        
-        # Apply causal mask (element-wise multiply with lower triangular mask)
-        qk_masked = qk * mask  # [chunk, chunk], fp32
-        
-        # Convert to fp16 for next MMA
-        qk_masked_fp16 = ct.astype(qk_masked, K.dtype)
-        
-        # qk_masked @ delta: [chunk, chunk] @ [chunk, d] = [chunk, d]
-        acc_o2 = ct.full((chunk_size, d), 0.0, dtype=ct.float32)
-        o2 = ct.mma(qk_masked_fp16, delta, acc_o2)  # fp16 inputs, fp32 accum
-        
-        # O = o1 + o2 (in fp32)
-        o_chunk = o1 + o2  # [chunk, d] in fp32
-        
-        # Store O chunk with TMA
-        o_out = ct.astype(o_chunk, O.dtype)
-        o_out = ct.reshape(o_out, (1, 1, 1, chunk_size, d))
-        ct.store(O, index=(b_idx, h_idx, c, 0, 0), tile=o_out, allow_tma=True)
-        
-        # ============================================================
-        # Step 6: Update state S = S * gate + delta^T @ K
-        #         This can overlap with next iteration's loads
-        # ============================================================
-        # delta^T @ K: [d, chunk] @ [chunk, d] = [d, d], fp16 inputs, fp32 accum
-        delta_t = ct.transpose(delta)  # [d, chunk] in fp16
-        acc_su = ct.full((d, d), 0.0, dtype=ct.float32)
-        s_update = ct.mma(delta_t, k, acc_su)  # fp16 inputs, fp32 accum
-        
-        # S = S * gate + delta^T @ K (gate is fp16 scalar, broadcast to all elements)
-        gate_f32 = ct.astype(gate, ct.float32)
-        s = s * gate_f32 + s_update
-    
-    # Store final state S for this (b, h)
-    s_out = ct.reshape(s, (1, 1, d, d))
-    ct.store(S, index=(b_idx, h_idx, 0, 0), tile=s_out)
-
-
-def compute_T_forward(
-    K: torch.Tensor,   # (B, H, seq_len, d), float16
-    B: torch.Tensor,   # (B, H, seq_len), float16 - beta values
-    chunk_size: int = CHUNK_SIZE
-) -> torch.Tensor:
-    """
-    Compute T = (I + A)^{-1} for all chunks in parallel.
-    
-    A = (K * diag(beta)) @ K^T, strictly lower triangular.
-    
-    Args:
-        K: Keys (B, H, seq_len, d), float16
-        B: Beta values (B, H, seq_len), float16
-        chunk_size: Processing chunk size (64)
-    
-    Returns:
-        T: Precomputed inverse matrices (B, H, num_chunks, chunk_size, chunk_size), float16
-    """
-    B_dim, H, seq_len, d = K.shape
-    device = K.device
-    num_chunks = seq_len // chunk_size
-    
-    assert seq_len % chunk_size == 0, f"seq_len ({seq_len}) must be divisible by chunk_size ({chunk_size})"
-    assert B.shape == (B_dim, H, seq_len), f"B shape mismatch: expected ({B_dim}, {H}, {seq_len}), got {B.shape}"
-    
-    # Reshape inputs: (B, H, num_chunks, chunk_size, d)
-    K_reshaped = K.reshape(B_dim, H, num_chunks, chunk_size, d).contiguous()
-    B_reshaped = B.reshape(B_dim, H, num_chunks, chunk_size).contiguous()
-    
-    # Output tensor: (B, H, num_chunks, chunk_size, chunk_size)
-    T = torch.empty(B_dim, H, num_chunks, chunk_size, chunk_size, dtype=K.dtype, device=device)
-    
-    # Launch kernel: one block per (B, H, chunk) tuple
-    grid = (B_dim * H * num_chunks,)
-    
-    with torch.cuda.device(device):
-        ct.launch(
-            torch.cuda.current_stream(), 
-            grid, 
-            compute_T_kernel,
-            (K_reshaped, B_reshaped, T, d, chunk_size, num_chunks, H)
-        )
-    
-    return T
-
-
-def fused_gdn_forward(
-    S: torch.Tensor,   # (B, H, d, d), float32
-    B: torch.Tensor,   # (B, H, seq_len), float16 - beta values
-    G: torch.Tensor,   # (B, H, num_chunks), float16 - gate values
-    V: torch.Tensor,   # (B, H, seq_len, d), float16
-    Q: torch.Tensor,   # (B, H, seq_len, d), float16
-    K: torch.Tensor,   # (B, H, seq_len, d), float16
+def fused_gdn(
+    S: torch.Tensor,    # (B, H, d, d), float32
+    T: torch.Tensor,    # (B, seq_len, H, chunk_size), bfloat16
+    G: torch.Tensor,    # (B, seq_len, H), bfloat16 - gate values
+    Beta: torch.Tensor, # (B, seq_len, H), bfloat16 - beta values
+    V: torch.Tensor,    # (B, seq_len, H, d), bfloat16
+    Q: torch.Tensor,    # (B, seq_len, H, d), bfloat16
+    K: torch.Tensor,    # (B, seq_len, H, d), bfloat16
     chunk_size: int = CHUNK_SIZE
 ) -> torch.Tensor:
     """
     Fully fused Gated Delta Net forward pass.
-    T is computed on-the-fly inside the kernel, not stored to global memory.
+    Combines scale_vk and gdn into a single kernel.
     
     Args:
         S: State matrices (B, H, d, d), float32, initialized to zeros
-        B: Beta values (B, H, seq_len), float16 - for computing A
-        G: Gate values (B, H, num_chunks), float16 - one scalar per chunk
-        V: Values (B, H, seq_len, d), float16
-        Q: Queries (B, H, seq_len, d), float16
-        K: Keys (B, H, seq_len, d), float16
-        chunk_size: Processing chunk size (64)
+        T: Precomputed T (B, seq_len, H, chunk_size), bfloat16
+        G: Gate values (B, seq_len, H), bfloat16
+        Beta: Beta values (B, seq_len, H), bfloat16
+        V: Values (B, seq_len, H, d), bfloat16
+        Q: Queries (B, seq_len, H, d), bfloat16
+        K: Keys (B, seq_len, H, d), bfloat16
+        chunk_size: Processing chunk size (default 64)
     
     Returns:
-        O: Output tensor (B, H, seq_len, d), float16
+        O: Output tensor (B, seq_len, H, d), bfloat16
         (S is updated in-place)
     """
-    B_dim, H, seq_len, d = K.shape
+    B_dim, seq_len, H, d = K.shape
     device = K.device
-    num_chunks = seq_len // chunk_size
+    num_chunks = (seq_len + chunk_size - 1) // chunk_size
     
-    assert seq_len % chunk_size == 0, f"seq_len ({seq_len}) must be divisible by chunk_size ({chunk_size})"
-    assert S.shape == (B_dim, H, d, d), f"S shape mismatch: expected ({B_dim}, {H}, {d}, {d}), got {S.shape}"
+    assert S.shape == (B_dim, H, d, d), f"S shape mismatch"
     assert S.dtype == torch.float32, "S must be float32"
-    assert B.shape == (B_dim, H, seq_len), f"B shape mismatch: expected ({B_dim}, {H}, {seq_len}), got {B.shape}"
-    assert G.shape == (B_dim, H, num_chunks), f"G shape mismatch: expected ({B_dim}, {H}, {num_chunks}), got {G.shape}"
+    assert T.shape == (B_dim, seq_len, H, chunk_size), f"T shape mismatch"
+    assert G.shape == (B_dim, seq_len, H), f"G shape mismatch"
+    assert G.dtype == torch.bfloat16, "G must be bfloat16"
+    assert Beta.shape == (B_dim, seq_len, H), f"Beta shape mismatch"
+    assert Beta.dtype == torch.bfloat16, "Beta must be bfloat16"
     
-    # Reshape inputs: (B, H, num_chunks, chunk_size, d)
-    B_reshaped = B.reshape(B_dim, H, num_chunks, chunk_size).contiguous()
-    V_reshaped = V.reshape(B_dim, H, num_chunks, chunk_size, d).contiguous()
-    Q_reshaped = Q.reshape(B_dim, H, num_chunks, chunk_size, d).contiguous()
-    K_reshaped = K.reshape(B_dim, H, num_chunks, chunk_size, d).contiguous()
-    
-    # Output tensor: (B, H, num_chunks, chunk_size, d)
-    O = torch.empty(B_dim, H, num_chunks, chunk_size, d, dtype=K.dtype, device=device)
-    
-    # Create causal mask (lower triangular)
-    causal_mask = torch.tril(torch.ones(chunk_size, chunk_size, dtype=torch.float32, device=device))
-    
-    # Launch kernel: one block per (B, H) pair
+    O = torch.empty(B_dim, seq_len, H, d, dtype=K.dtype, device=device)
     grid = (B_dim * H,)
     
     with torch.cuda.device(device):
@@ -622,73 +280,15 @@ def fused_gdn_forward(
             torch.cuda.current_stream(), 
             grid, 
             fused_gdn_kernel,
-            (S, B_reshaped, V_reshaped, Q_reshaped, K_reshaped, G, O,
-             causal_mask, d, chunk_size, num_chunks, H)
+            (S, T, V, Q, K, G, Beta, O,
+             d, chunk_size, num_chunks, H, seq_len)
         )
     
-    return O.reshape(B_dim, H, seq_len, d)
+    return O
 
 
-def gated_delta_net_forward(
-    S: torch.Tensor,   # (B, H, d, d), float32
-    T: torch.Tensor,   # (B, H, num_chunks, chunk_size, chunk_size), float16
-    G: torch.Tensor,   # (B, H, num_chunks), float16 - gate values
-    V: torch.Tensor,   # (B, H, seq_len, d), float16
-    Q: torch.Tensor,   # (B, H, seq_len, d), float16
-    K: torch.Tensor,   # (B, H, seq_len, d), float16
-    chunk_size: int = CHUNK_SIZE
-) -> torch.Tensor:
-    """
-    Gated Delta Net forward pass (batched) with precomputed T and gating.
-    
-    Args:
-        S: State matrices (B, H, d, d), float32, initialized to zeros
-        T: Precomputed T = (I + A)^{-1} (B, H, num_chunks, chunk_size, chunk_size), float16
-        G: Gate values (B, H, num_chunks), float16 - one scalar per chunk
-        V: Values (B, H, seq_len, d), float16
-        Q: Queries (B, H, seq_len, d), float16
-        K: Keys (B, H, seq_len, d), float16
-        chunk_size: Processing chunk size (64 or 128)
-    
-    Returns:
-        O: Output tensor (B, H, seq_len, d), float16
-        (S is updated in-place)
-    """
-    B_dim, H, seq_len, d = K.shape
-    device = K.device
-    num_chunks = seq_len // chunk_size
-    
-    assert seq_len % chunk_size == 0, f"seq_len ({seq_len}) must be divisible by chunk_size ({chunk_size})"
-    assert S.shape == (B_dim, H, d, d), f"S shape mismatch: expected ({B_dim}, {H}, {d}, {d}), got {S.shape}"
-    assert S.dtype == torch.float32, "S must be float32"
-    assert T.shape == (B_dim, H, num_chunks, chunk_size, chunk_size), f"T shape mismatch"
-    assert G.shape == (B_dim, H, num_chunks), f"G shape mismatch: expected ({B_dim}, {H}, {num_chunks}), got {G.shape}"
-    
-    # Reshape inputs: (B, H, num_chunks, chunk_size, d)
-    V_reshaped = V.reshape(B_dim, H, num_chunks, chunk_size, d).contiguous()
-    Q_reshaped = Q.reshape(B_dim, H, num_chunks, chunk_size, d).contiguous()
-    K_reshaped = K.reshape(B_dim, H, num_chunks, chunk_size, d).contiguous()
-    
-    # Output tensor: (B, H, num_chunks, chunk_size, d)
-    O = torch.empty(B_dim, H, num_chunks, chunk_size, d, dtype=K.dtype, device=device)
-    
-    # Create causal mask (lower triangular) - shared across batches
-    causal_mask = torch.tril(torch.ones(chunk_size, chunk_size, dtype=torch.float32, device=device))
-    
-    # Launch kernel: one block per (B, H) pair
-    grid = (B_dim * H,)
-    
-    with torch.cuda.device(device):
-        ct.launch(
-            torch.cuda.current_stream(), 
-            grid, 
-            gated_delta_net_kernel,
-            (S, T, V_reshaped, Q_reshaped, K_reshaped, G, O,
-             causal_mask, d, chunk_size, num_chunks, H)
-        )
-    
-    # Reshape output back to (B, H, seq_len, d)
-    return O.reshape(B_dim, H, seq_len, d)
+# Import the separate kernels from gdn.py for comparison
+from gdn import scale_vk, gdn, CHUNK_SIZE as GDN_CHUNK_SIZE
 
 
 if __name__ == "__main__":
@@ -699,7 +299,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-iters", type=int, default=100)
     args = parser.parse_args()
     
-    print("--- Fused GDN Benchmark (B, H, seq, d) ---")
+    print("--- Fused GDN Benchmark ---")
     
     B_dim = args.batch
     H = args.heads
@@ -707,51 +307,58 @@ if __name__ == "__main__":
     d = HEAD_DIM
     chunk_size = CHUNK_SIZE
     device = 'cuda'
-    num_chunks = seq_len // chunk_size
+    num_chunks = (seq_len + chunk_size - 1) // chunk_size
     
-    # Initialize inputs with shape (B, H, ...)
+    # Initialize inputs
     S = torch.zeros(B_dim, H, d, d, dtype=torch.float32, device=device)
-    V = torch.randn(B_dim, H, seq_len, d, dtype=torch.float16, device=device) * 0.02
-    Q = torch.randn(B_dim, H, seq_len, d, dtype=torch.float16, device=device) * 0.02
-    K = torch.randn(B_dim, H, seq_len, d, dtype=torch.float16, device=device) * 0.02
-    Beta = torch.randn(B_dim, H, seq_len, dtype=torch.float16, device=device) * 0.1  # Beta values
-    G = torch.rand(B_dim, H, num_chunks, dtype=torch.float16, device=device)     # Gate values (0-1)
+    V = torch.randn(B_dim, seq_len, H, d, dtype=torch.bfloat16, device=device) * 0.02
+    Q = torch.randn(B_dim, seq_len, H, d, dtype=torch.bfloat16, device=device) * 0.02
+    K = torch.randn(B_dim, seq_len, H, d, dtype=torch.bfloat16, device=device) * 0.02
+    G = torch.sigmoid(torch.randn(B_dim, seq_len, H, dtype=torch.bfloat16, device=device))
+    Beta = torch.sigmoid(torch.rand(B_dim, seq_len, H, dtype=torch.bfloat16, device=device))
+
+    # Create dummy T tensor (identity-like for testing)
+    T = torch.zeros(B_dim, seq_len, H, chunk_size, dtype=torch.bfloat16, device=device)
+    for c in range(num_chunks):
+        for i in range(chunk_size):
+            t_idx = c * chunk_size + i
+            if t_idx < seq_len:
+                T[:, t_idx, :, i] = 1.0
     
     print(f"B={B_dim}, H={H}, seq={seq_len}, d={d}, chunks={num_chunks}")
-    print(f"Total batch (B*H)={B_dim * H}")
     
     # ============================================================
-    # Benchmark 1: Two-Stage (compute_T + GDN)
+    # Benchmark 1: Two-Stage (scale_vk + gdn)
     # ============================================================
-    print("\n[Two-Stage: compute_T + GDN]")
+    print("\n[Two-Stage: scale_vk + gdn]")
     
     # Warmup
     for _ in range(3):
-        T = compute_T_forward(K, Beta, chunk_size)
-        O1 = gated_delta_net_forward(torch.zeros_like(S), T, G, V, Q, K, chunk_size)
+        V_scaled, K_scaled = scale_vk(V, K, G, Beta, tile_size=chunk_size)
+        O1 = gdn(torch.zeros_like(S), T, G, V_scaled, Q, K, K_scaled, chunk_size)
     torch.cuda.synchronize()
     
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     
-    # Timing - Stage 1: compute_T
+    # Timing - Stage 1: scale_vk
     start.record()
     for _ in range(args.num_iters):
-        T = compute_T_forward(K, Beta, chunk_size)
+        V_scaled, K_scaled = scale_vk(V, K, G, Beta, tile_size=chunk_size)
     end.record()
     torch.cuda.synchronize()
-    ms_T = start.elapsed_time(end) / args.num_iters
-    print(f"  compute_T Time: {ms_T:.3f} ms")
+    ms_scale = start.elapsed_time(end) / args.num_iters
+    print(f"  scale_vk Time: {ms_scale:.3f} ms")
     
-    # Timing - Stage 2: GDN
+    # Timing - Stage 2: gdn
     start.record()
     for _ in range(args.num_iters):
-        O1 = gated_delta_net_forward(torch.zeros_like(S), T, G, V, Q, K, chunk_size)
+        O1 = gdn(torch.zeros_like(S), T, G, V_scaled, Q, K, K_scaled, chunk_size)
     end.record()
     torch.cuda.synchronize()
-    ms_GDN = start.elapsed_time(end) / args.num_iters
-    print(f"  GDN Time: {ms_GDN:.3f} ms")
-    print(f"  Total: {ms_T + ms_GDN:.3f} ms")
+    ms_gdn = start.elapsed_time(end) / args.num_iters
+    print(f"  gdn Time: {ms_gdn:.3f} ms")
+    print(f"  Total: {ms_scale + ms_gdn:.3f} ms")
     
     # ============================================================
     # Benchmark 2: Fully Fused (single kernel)
@@ -760,13 +367,13 @@ if __name__ == "__main__":
     
     # Warmup
     for _ in range(3):
-        O2 = fused_gdn_forward(torch.zeros_like(S), Beta, G, V, Q, K, chunk_size)
+        O2 = fused_gdn(torch.zeros_like(S), T, G, Beta, V, Q, K, chunk_size)
     torch.cuda.synchronize()
     
     # Timing
     start.record()
     for _ in range(args.num_iters):
-        O2 = fused_gdn_forward(torch.zeros_like(S), Beta, G, V, Q, K, chunk_size)
+        O2 = fused_gdn(torch.zeros_like(S), T, G, Beta, V, Q, K, chunk_size)
     end.record()
     torch.cuda.synchronize()
     ms_fused = start.elapsed_time(end) / args.num_iters
@@ -775,7 +382,7 @@ if __name__ == "__main__":
     # ============================================================
     # Comparison
     # ============================================================
-    print(f"\nSpeedup: {(ms_T + ms_GDN) / ms_fused:.2f}x")
+    print(f"\nSpeedup: {(ms_scale + ms_gdn) / ms_fused:.2f}x")
     
     # Verify correctness
     diff = (O1 - O2).abs().max().item()
