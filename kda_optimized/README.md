@@ -23,13 +23,11 @@ PYTHONPATH=..:$PYTHONPATH python test.py --test all
 
 Options:
 - `--test {naive,fla,benchmark,all}` - Test to run (default: all)
-- `--batch-size` - Batch size for correctness tests (default: 1)
-- `--seq-len` - Sequence length for correctness tests (default: 128)
-- `--num-heads` - Number of heads for correctness tests (default: 2)
+- `--batch-size` - Batch size (default: 1)
+- `--seq-len` - Sequence length (default: 8192)
+- `--num-heads` - Number of heads (default: 96)
 - `--head-dim` - Head dimension (default: 128)
 - `--chunk-size` - Chunk size (default: 64)
-- `--bench-seq-len` - Sequence length for benchmark (default: 8192)
-- `--bench-num-heads` - Number of heads for benchmark (default: 96)
 
 ### Run Profiling
 

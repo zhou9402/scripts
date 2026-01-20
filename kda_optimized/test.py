@@ -222,13 +222,10 @@ if __name__ == "__main__":
                        help="Test to run: naive (vs naive_recurrent), fla (vs chunk_kda), "
                             "benchmark (speed comparison), all (all tests)")
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--seq-len", type=int, default=128)
-    parser.add_argument("--num-heads", type=int, default=2)
+    parser.add_argument("--seq-len", type=int, default=8192)
+    parser.add_argument("--num-heads", type=int, default=96)
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--chunk-size", type=int, default=64)
-    parser.add_argument("--bench-batch-size", type=int, default=1)
-    parser.add_argument("--bench-seq-len", type=int, default=8192)
-    parser.add_argument("--bench-num-heads", type=int, default=96)
     
     args = parser.parse_args()
     
@@ -252,7 +249,7 @@ if __name__ == "__main__":
     
     if args.test in ("benchmark", "all"):
         print("=" * 70)
-        benchmark(args.bench_batch_size, args.bench_seq_len, args.bench_num_heads, 
+        benchmark(args.batch_size, args.seq_len, args.num_heads, 
                  args.head_dim, args.chunk_size)
         results.append(("Benchmark", True))
         print()
