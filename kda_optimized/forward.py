@@ -6,8 +6,8 @@ KDA Forward Pass - Optimized Fused Implementation
 
 This module combines all 4 kernels into a single forward pass:
 1. cumsum_fused.py     - Triton: cumsum + all scaling operations
-2. intra_parallel.py   - Triton: A_qk, A_kkd computation (token-parallel)
-3. inter_solve.py      - Triton: A_kk solve (from FLA)
+2. K2: chunk_kda_fwd_kernel_intra_sub_chunk - Triton: A_qk, A_kkd computation (NEW optimized, safe_gate=True)
+3. K3: chunk_kda_fwd_kernel_inter_solve_fused - Triton: off-diagonal A_qk + A_kk solve
 4. cutile_kernel.py    - cuTile: fused W, U, O, S update
 """
 
@@ -16,17 +16,18 @@ import torch.nn.functional as F
 import triton
 
 from fla.ops.utils.constant import RCP_LN2
+# Import NEW optimized K2 kernel from FLA (safe_gate=True version)
+from fla.ops.kda.chunk_intra import chunk_kda_fwd_kernel_intra_sub_chunk
+# Import K3 kernel (same as before)
+from fla.ops.kda.chunk_intra import chunk_kda_fwd_kernel_inter_solve_fused
+from fla.utils import IS_GATHER_SUPPORTED
 
 # Handle both package import and direct file import
 try:
     from .cumsum_fused import chunk_local_cumsum_with_scaling
-    from .intra_parallel import chunk_kda_fwd_intra_token_parallel
-    from .inter_solve import chunk_kda_fwd_kernel_inter_solve_fused
     from .cutile_kernel import launch_kda_kernel
 except ImportError:
     from cumsum_fused import chunk_local_cumsum_with_scaling
-    from intra_parallel import chunk_kda_fwd_intra_token_parallel
-    from inter_solve import chunk_kda_fwd_kernel_inter_solve_fused
     from cutile_kernel import launch_kda_kernel
 
 
@@ -102,26 +103,33 @@ def kda_forward(
         attn_scale=scale,
     )
     
-    # ========== Step 2: A_qk, A_kkd computation (Triton, token-parallel) ==========
+    # ========== Step 2: A_qk, A_kkd computation (Triton, NEW optimized K2) ==========
     BT = chunk_size
     BC = 16
     NT = triton.cdiv(T, BT)
+    NC = triton.cdiv(BT, BC)
+    BK = triton.next_power_of_2(K)
     
     A_qk = torch.empty(B, T, H, BT, device=device, dtype=k.dtype)
     A_kk = torch.zeros(B, T, H, BT, device=device, dtype=k.dtype)
     A_kkd = torch.empty(B, T, H, BC, device=device, dtype=torch.float32)
     
-    A_qk, A_kkd = chunk_kda_fwd_intra_token_parallel(
-        q=q, k=k, gk=g_cumsum, beta=beta, Aqk=A_qk, Akk=A_kkd,
-        scale=scale, cu_seqlens=None, chunk_size=BT, sub_chunk_size=BC,
+    # NEW optimized K2: chunk_kda_fwd_kernel_intra_sub_chunk (safe_gate=True version)
+    # This kernel computes diagonal blocks + does forward substitution internally
+    grid_k2 = (NT, NC, B * H)
+    chunk_kda_fwd_kernel_intra_sub_chunk[grid_k2](
+        q=q, k=k, g=g_cumsum, beta=beta, Aqk=A_qk, Akk=A_kkd,
+        scale=scale, cu_seqlens=None, chunk_indices=None,
+        T=T, H=H, K=K, BT=BT, BC=BC, BK=BK,
+        USE_GATHER=IS_GATHER_SUPPORTED,
     )
     
-    # ========== Step 3: A_kk solve (Triton, chunk-parallel) ==========
-    grid = (NT, B * H)
-    chunk_kda_fwd_kernel_inter_solve_fused[grid](
+    # ========== Step 3: A_kk solve (Triton, K3 with USE_SAFE_GATE=True) ==========
+    grid_k3 = (NT, B * H)
+    chunk_kda_fwd_kernel_inter_solve_fused[grid_k3](
         q=q, k=k, g=g_cumsum, beta=beta, Aqk=A_qk, Akkd=A_kkd, Akk=A_kk,
         scale=scale, cu_seqlens=None, chunk_indices=None,
-        T=T, H=H, K=K, BT=BT, BC=BC, USE_SAFE_GATE=False,
+        T=T, H=H, K=K, BT=BT, BC=BC, USE_SAFE_GATE=True,
     )
     
     # ========== Step 4: Fused kernel (cuTile, sequential across chunks) ==========

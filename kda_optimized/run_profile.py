@@ -28,7 +28,7 @@ from fla.ops.kda import chunk_kda
 from kda_optimized import kda_forward
 
 
-def main(batch_size=4, seq_len=16384, num_heads=32, head_dim=128, 
+def main(batch_size=1, seq_len=8192, num_heads=96, head_dim=128, 
          chunk_size=64, num_iters=10):
     device = "cuda"
     dtype = torch.bfloat16
@@ -42,6 +42,8 @@ def main(batch_size=4, seq_len=16384, num_heads=32, head_dim=128,
     V = torch.randn(batch_size, seq_len, num_heads, head_dim, dtype=dtype, device=device)
     Beta = torch.rand(batch_size, seq_len, num_heads, dtype=dtype, device=device).sigmoid()
     G = F.logsigmoid(torch.randn(batch_size, seq_len, num_heads, head_dim, dtype=torch.float, device=device))
+    # Clamp G to [-5, 0] to enable safe_gate (TensorCore acceleration)
+    G = G.clamp(-5, 0)
     h0 = torch.zeros(batch_size, num_heads, head_dim, head_dim, dtype=torch.float32, device=device)
     scale = head_dim ** -0.5
     
@@ -54,7 +56,8 @@ def main(batch_size=4, seq_len=16384, num_heads=32, head_dim=128,
     for _ in range(5):
         O_fla, _ = chunk_kda(
             q=Q_norm.clone(), k=K_norm.clone(), v=V.clone(), g=G.clone(),
-            beta=Beta.clone(), scale=scale, initial_state=h0.clone(), output_final_state=True
+            beta=Beta.clone(), scale=scale, initial_state=h0.clone(), output_final_state=True,
+            use_qk_l2norm_in_kernel=False, use_gate_in_kernel=False, safe_gate=True
         )
         O_opt, _ = kda_forward(
             q=Q_norm.clone(), k=K_norm.clone(), v=V.clone(), g=G.clone(),
@@ -66,15 +69,16 @@ def main(batch_size=4, seq_len=16384, num_heads=32, head_dim=128,
     # Start profiling
     torch.cuda.cudart().cudaProfilerStart()
     
-    # ========== Profile FLA ==========
-    print(f"Profiling FLA chunk_kda ({num_iters} iterations)...")
-    torch.cuda.nvtx.range_push("FLA_chunk_kda")
+    # ========== Profile FLA (safe_gate=True) ==========
+    print(f"Profiling FLA chunk_kda safe_gate=True ({num_iters} iterations)...")
+    torch.cuda.nvtx.range_push("FLA_chunk_kda_safe_gate")
     
     for i in range(num_iters):
         torch.cuda.nvtx.range_push(f"FLA_iter_{i}")
         O_fla, _ = chunk_kda(
             q=Q_norm, k=K_norm, v=V, g=G,
-            beta=Beta, scale=scale, initial_state=h0.clone(), output_final_state=True
+            beta=Beta, scale=scale, initial_state=h0.clone(), output_final_state=True,
+            use_qk_l2norm_in_kernel=False, use_gate_in_kernel=False, safe_gate=True
         )
         torch.cuda.synchronize()
         torch.cuda.nvtx.range_pop()
@@ -107,9 +111,9 @@ def main(batch_size=4, seq_len=16384, num_heads=32, head_dim=128,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Profile KDA Optimized")
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--seq-len", type=int, default=16384)
-    parser.add_argument("--num-heads", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--seq-len", type=int, default=8192)
+    parser.add_argument("--num-heads", type=int, default=96)
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--chunk-size", type=int, default=64)
     parser.add_argument("--num-iters", type=int, default=10)
