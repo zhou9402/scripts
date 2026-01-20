@@ -63,7 +63,7 @@ def fused_gdn_kernel(
     G,      # (B, num_chunks, chunk_size, H) float32 - gate cumsum values
     Beta,   # (B, num_chunks, chunk_size, H) bfloat16 - beta values
     O,      # (B, num_chunks, chunk_size, H, d) bfloat16 - output
-    d: ConstInt,           # head_dim = 128
+        d: ConstInt,           # head_dim = 128
     chunk_size: ConstInt,  # 64 or 128
     H: ConstInt            # num_heads
 ):
