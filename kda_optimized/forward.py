@@ -6,6 +6,7 @@ KDA Forward Pass - Optimized Fused Implementation
 
 This module combines all 4 kernels into a single forward pass:
 1. cumsum_fused.py     - Triton: cumsum + all scaling operations
+   (or act_cumsum_scale_fused.py when use_gate_in_kernel=True)
 2. K2: chunk_kda_fwd_kernel_intra_sub_chunk - Triton: A_qk, A_kkd computation (NEW optimized, safe_gate=True)
 3. K3: chunk_kda_fwd_kernel_inter_solve_fused - Triton: off-diagonal A_qk + A_kk solve
 4. cutile_kernel.py    - cuTile: fused W, U, O, S update
@@ -25,9 +26,11 @@ from fla.utils import IS_GATHER_SUPPORTED
 # Handle both package import and direct file import
 try:
     from .cumsum_fused import chunk_local_cumsum_with_scaling
+    from .act_cumsum_scale_fused import act_cumsum_scale_fused
     from .cutile_kernel import launch_kda_kernel
 except ImportError:
     from cumsum_fused import chunk_local_cumsum_with_scaling
+    from act_cumsum_scale_fused import act_cumsum_scale_fused
     from cutile_kernel import launch_kda_kernel
 
 
@@ -42,12 +45,19 @@ def kda_forward(
     output_final_state: bool = False,
     chunk_size: int = 64,
     normalize_qk: bool = True,
+    # New parameters for gate activation fusion
+    use_gate_in_kernel: bool = False,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    safe_gate: bool = False,
+    lower_bound: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
     KDA forward pass using optimized fused cuTile kernel.
     
     This implementation uses 4 kernels:
     1. Triton: Fused cumsum + scaling (parallel across chunks)
+       - When use_gate_in_kernel=True, also fuses gate activation
     2. Triton: A_qk, A_kkd computation (token-parallel)
     3. Triton: A_kk solve (chunk-parallel)
     4. cuTile: Fused W, U, O, S update (sequential across chunks)
@@ -59,13 +69,22 @@ def kda_forward(
         q: Query tensor [B, T, H, K]
         k: Key tensor [B, T, H, K]
         v: Value tensor [B, T, H, V]
-        g: Per-key gate tensor [B, T, H, K] (log-space, will be cumsum'd)
+        g: Per-key gate tensor [B, T, H, K]
+            - If use_gate_in_kernel=False: pre-activated gate (log-space)
+            - If use_gate_in_kernel=True: raw gate (before activation)
         beta: Beta tensor [B, T, H]
         scale: Attention scale (default: K^{-0.5})
         initial_state: Initial state [B, H, K, V] (default: zeros)
         output_final_state: Whether to return final state
         chunk_size: Chunk size for chunked attention (default: 64)
         normalize_qk: Whether to L2-normalize Q and K (default: True)
+        use_gate_in_kernel: Whether to fuse gate activation in kernel (default: False)
+            When True, computes: g = -exp(A_log) * softplus(g + dt_bias)
+        A_log: Log of decay rate [H], required when use_gate_in_kernel=True
+        dt_bias: Optional bias for gate [H * K], used when use_gate_in_kernel=True
+        safe_gate: Whether to use safe_gate mode (default: False)
+            When True with use_gate_in_kernel, uses: g = lower_bound * sigmoid(exp(A_log) * g)
+        lower_bound: Lower bound for safe_gate mode (e.g., -5.0)
     
     Returns:
         output: Output tensor [B, T, H, V]
@@ -76,6 +95,16 @@ def kda_forward(
     device = q.device
     
     assert T % chunk_size == 0, f"seq_len ({T}) must be divisible by chunk_size ({chunk_size})"
+    
+    # Validate use_gate_in_kernel parameters
+    if use_gate_in_kernel:
+        assert A_log is not None, "A_log must be provided when use_gate_in_kernel=True"
+        assert A_log.shape == (H,), f"A_log shape must be [H], got {A_log.shape}"
+        if dt_bias is not None:
+            assert dt_bias.shape == (H * K,), f"dt_bias shape must be [H * K], got {dt_bias.shape}"
+        if safe_gate:
+            if lower_bound is None:
+                lower_bound = -5.0  # Default safe_gate lower bound
     
     if scale is None:
         scale = K ** -0.5
@@ -94,14 +123,29 @@ def kda_forward(
     # ========== Step 1: Fused cumsum + scaling (Triton, parallel) ==========
     # Computes: g_cumsum, k_scaled, kg, q_scaled, gk_last_exp
     # Note: V_scaled is NOT computed - saves one [B, T, H, d] tensor!
-    g_cumsum, k_scaled, kg, q_scaled, gk_last_exp = chunk_local_cumsum_with_scaling(
-        g=g,
-        k=k,
-        q=q,
-        chunk_size=chunk_size,
-        cumsum_scale=RCP_LN2,
-        attn_scale=scale,
-    )
+    if use_gate_in_kernel:
+        # Use fused activation + cumsum + scaling kernel
+        g_cumsum, k_scaled, kg, q_scaled, gk_last_exp = act_cumsum_scale_fused(
+            g=g,
+            k=k,
+            q=q,
+            A_log=A_log,
+            chunk_size=chunk_size,
+            cumsum_scale=RCP_LN2,
+            attn_scale=scale,
+            dt_bias=dt_bias,
+            lower_bound=lower_bound if safe_gate else None,
+        )
+    else:
+        # Use standard cumsum + scaling kernel (g is pre-activated)
+        g_cumsum, k_scaled, kg, q_scaled, gk_last_exp = chunk_local_cumsum_with_scaling(
+            g=g,
+            k=k,
+            q=q,
+            chunk_size=chunk_size,
+            cumsum_scale=RCP_LN2,
+            attn_scale=scale,
+        )
     
     # ========== Step 2: A_qk, A_kkd computation (Triton, NEW optimized K2) ==========
     BT = chunk_size

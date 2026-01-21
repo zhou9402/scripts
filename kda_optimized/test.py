@@ -9,9 +9,26 @@ Tests correctness against:
 1. FLA naive_recurrent_kda (reference)
 2. FLA chunk_kda (optimized reference)
 
+Default mode (use_gate_in_kernel=True, safe_gate=True):
+- Fuses gate activation into cumsum kernel
+- Uses sigmoid activation with lower_bound=-5.0
+
+Optional modes:
+- --no-gate-in-kernel: Use pre-activated g (original behavior)
+- --no-safe-gate: Use softplus activation instead of sigmoid
+
 Usage:
-    cd /ran/kda_cutile/kda_optimized
-    PYTHONPATH=/ran/kda_cutile/flash-linear-attention:$PYTHONPATH python test.py
+    cd /ran/kda_cutile/scripts/kda_optimized
+    PYTHONPATH=/ran/kda_cutile/flash-linear-attention:/ran/kda_cutile/scripts:$PYTHONPATH python test.py
+    
+    # Default: fused activation + safe gate (sigmoid)
+    python test.py
+    
+    # Fused activation with softplus (no safe gate)
+    python test.py --no-safe-gate
+    
+    # Disable fused activation (pre-activated g)
+    python test.py --no-gate-in-kernel
 """
 
 import argparse
@@ -19,10 +36,11 @@ import torch
 import torch.nn.functional as F
 
 import sys
-sys.path.insert(0, '/ran/kda_cutile/kda_optimized')
+sys.path.insert(0, '/ran/kda_cutile/scripts/kda_optimized')
 
 from fla.ops.kda import chunk_kda
 from fla.ops.kda.naive import naive_recurrent_kda
+from fla.ops.kda.gate import naive_kda_gate, naive_kda_lowerbound_gate
 
 # Import from kda_optimized package
 from kda_optimized import kda_forward
@@ -47,17 +65,21 @@ def compare_tensors(name, t1, t2, atol=1e-2, rtol=1e-2):
     return is_close
 
 
-def prepare_inputs(batch_size, seq_len, num_heads, head_dim, device="cuda", dtype=torch.bfloat16):
-    """Prepare input tensors."""
+def prepare_inputs(batch_size, seq_len, num_heads, head_dim, device="cuda", dtype=torch.bfloat16,
+                   use_gate_in_kernel=False, safe_gate=False):
+    """Prepare input tensors.
+    
+    Args:
+        use_gate_in_kernel: If True, returns raw g (before activation) and A_log, dt_bias
+        safe_gate: If True with use_gate_in_kernel, uses sigmoid activation with lower_bound
+                   If False with use_gate_in_kernel, uses softplus activation
+    """
     torch.manual_seed(42)
     
     Q = torch.randn(batch_size, seq_len, num_heads, head_dim, dtype=dtype, device=device)
     K = torch.randn(batch_size, seq_len, num_heads, head_dim, dtype=dtype, device=device)
     V = torch.randn(batch_size, seq_len, num_heads, head_dim, dtype=dtype, device=device)
     Beta = torch.rand(batch_size, seq_len, num_heads, dtype=dtype, device=device).sigmoid()
-    G = F.logsigmoid(torch.randn(batch_size, seq_len, num_heads, head_dim, dtype=torch.float, device=device))
-    # Clamp G to [-5, 0] to enable safe_gate (TensorCore acceleration)
-    G = G.clamp(-5, 0)
     h0 = torch.zeros(batch_size, num_heads, head_dim, head_dim, dtype=torch.float32, device=device)
     scale = head_dim ** -0.5
     
@@ -65,35 +87,96 @@ def prepare_inputs(batch_size, seq_len, num_heads, head_dim, device="cuda", dtyp
     Q_norm = F.normalize(Q, p=2, dim=-1)
     K_norm = F.normalize(K, p=2, dim=-1)
     
-    return Q, K, V, Beta, G, h0, scale, Q_norm, K_norm
+    if use_gate_in_kernel:
+        if safe_gate:
+            # Safe gate mode: sigmoid activation with lower_bound
+            # Raw g can be any value, activation will bound it to [lower_bound, 0)
+            lower_bound = -5.0
+            G_raw = torch.randn(batch_size, seq_len, num_heads, head_dim, dtype=dtype, device=device)
+            # A_log uniform in [1, 16] as in FLA tests
+            A_log = torch.log(torch.empty(num_heads, dtype=torch.float32, device=device).uniform_(1, 16))
+            dt_bias = torch.randn(num_heads * head_dim, dtype=torch.float32, device=device)
+            G_activated = naive_kda_lowerbound_gate(G_raw.float(), A_log, dt_bias, lower_bound)
+        else:
+            # Softplus mode: -exp(A_log) * softplus(g + dt_bias)
+            # To keep activated g in safe range, we:
+            # 1. Use small A_log so exp(A_log) is small
+            # 2. Use small g_raw and dt_bias so softplus output is small
+            # Formula: g_activated ≈ -exp(A_log) * softplus(g_raw + dt_bias)
+            # For softplus: softplus(x) ≈ x for x > 0, ≈ log(2) for x ≈ 0
+            # We want |g_activated| < 5, so exp(A_log) * softplus(...) < 5
+            A_log = torch.randn(num_heads, dtype=torch.float32, device=device) * 0.5  # Small A_log
+            dt_bias = torch.randn(num_heads * head_dim, dtype=torch.float32, device=device) * 0.1
+            # Use logsigmoid to generate g_raw in (-inf, 0], then softplus gives small values
+            G_raw = F.logsigmoid(torch.randn(batch_size, seq_len, num_heads, head_dim, dtype=torch.float32, device=device))
+            G_raw = G_raw.to(dtype)
+            G_activated = naive_kda_gate(G_raw.float(), A_log, dt_bias)
+        
+        return Q, K, V, Beta, G_raw, G_activated, h0, scale, Q_norm, K_norm, A_log, dt_bias
+    else:
+        # Pre-activated g
+        G = F.logsigmoid(torch.randn(batch_size, seq_len, num_heads, head_dim, dtype=torch.float, device=device))
+        # Clamp G to [-5, 0] for numerical stability
+        if safe_gate:
+            G = G.clamp(-5, 0)
+        
+        return Q, K, V, Beta, G, h0, scale, Q_norm, K_norm
 
 
-def test_vs_naive(batch_size=1, seq_len=128, num_heads=2, head_dim=128, chunk_size=64):
+def test_vs_naive(batch_size=1, seq_len=128, num_heads=2, head_dim=128, chunk_size=64,
+                  use_gate_in_kernel=False, safe_gate=False):
     """Test KDA Optimized vs naive_recurrent_kda for correctness."""
     device, dtype = "cuda", torch.bfloat16
     
-    print(f"{BOLD}{CYAN}Test: KDA Optimized vs Naive{RESET}")
+    mode_str = ""
+    if use_gate_in_kernel:
+        mode_str = " (use_gate_in_kernel=True"
+        if safe_gate:
+            mode_str += ", safe_gate=True)"
+        else:
+            mode_str += ")"
+    
+    print(f"{BOLD}{CYAN}Test: KDA Optimized vs Naive{mode_str}{RESET}")
     print(f"B={batch_size}, T={seq_len}, H={num_heads}, d={head_dim}, chunk_size={chunk_size}")
     print("-" * 60)
     
-    Q, K, V, Beta, G, h0, scale, Q_norm, K_norm = prepare_inputs(
-        batch_size, seq_len, num_heads, head_dim, device, dtype
-    )
+    if use_gate_in_kernel:
+        Q, K, V, Beta, G_raw, G_activated, h0, scale, Q_norm, K_norm, A_log, dt_bias = prepare_inputs(
+            batch_size, seq_len, num_heads, head_dim, device, dtype,
+            use_gate_in_kernel=True, safe_gate=safe_gate
+        )
+        lower_bound = -5.0 if safe_gate else None
+    else:
+        Q, K, V, Beta, G, h0, scale, Q_norm, K_norm = prepare_inputs(
+            batch_size, seq_len, num_heads, head_dim, device, dtype,
+            use_gate_in_kernel=False, safe_gate=safe_gate
+        )
+        G_activated = G
+        A_log, dt_bias, lower_bound = None, None, None
     
-    # Naive KDA (reference)
+    # Naive KDA (reference) - always uses activated g
     print(f"\n{YELLOW}Running naive_recurrent_kda...{RESET}")
     O_naive, S_naive = naive_recurrent_kda(
-        q=Q_norm.clone(), k=K_norm.clone(), v=V.clone(), g=G.clone(),
+        q=Q_norm.clone(), k=K_norm.clone(), v=V.clone(), g=G_activated.clone(),
         beta=Beta.clone(), scale=scale, initial_state=h0.clone(), output_final_state=True
     )
     
     # KDA Optimized
     print(f"{YELLOW}Running KDA Optimized...{RESET}")
-    O_opt, S_opt = kda_forward(
-        q=Q.clone(), k=K.clone(), v=V.clone(), g=G.clone(),
-        beta=Beta.clone(), scale=scale, initial_state=h0.clone(),
-        output_final_state=True, chunk_size=chunk_size, normalize_qk=True
-    )
+    if use_gate_in_kernel:
+        O_opt, S_opt = kda_forward(
+            q=Q.clone(), k=K.clone(), v=V.clone(), g=G_raw.clone(),
+            beta=Beta.clone(), scale=scale, initial_state=h0.clone(),
+            output_final_state=True, chunk_size=chunk_size, normalize_qk=True,
+            use_gate_in_kernel=True, A_log=A_log, dt_bias=dt_bias,
+            safe_gate=safe_gate, lower_bound=lower_bound
+        )
+    else:
+        O_opt, S_opt = kda_forward(
+            q=Q.clone(), k=K.clone(), v=V.clone(), g=G_activated.clone(),
+            beta=Beta.clone(), scale=scale, initial_state=h0.clone(),
+            output_final_state=True, chunk_size=chunk_size, normalize_qk=True
+        )
     
     # Compare
     print(f"\n{BOLD}Results:{RESET}")
@@ -109,33 +192,70 @@ def test_vs_naive(batch_size=1, seq_len=128, num_heads=2, head_dim=128, chunk_si
     return o_ok and s_ok
 
 
-def test_vs_fla(batch_size=1, seq_len=128, num_heads=2, head_dim=128, chunk_size=64):
+def test_vs_fla(batch_size=1, seq_len=128, num_heads=2, head_dim=128, chunk_size=64,
+                use_gate_in_kernel=False, safe_gate=False):
     """Test KDA Optimized vs FLA chunk_kda."""
     device, dtype = "cuda", torch.bfloat16
     
-    print(f"{BOLD}{CYAN}Test: KDA Optimized vs FLA chunk_kda{RESET}")
+    mode_str = ""
+    if use_gate_in_kernel:
+        mode_str = " (use_gate_in_kernel=True"
+        if safe_gate:
+            mode_str += ", safe_gate=True)"
+        else:
+            mode_str += ")"
+    
+    print(f"{BOLD}{CYAN}Test: KDA Optimized vs FLA chunk_kda{mode_str}{RESET}")
     print(f"B={batch_size}, T={seq_len}, H={num_heads}, d={head_dim}, chunk_size={chunk_size}")
     print("-" * 60)
     
-    Q, K, V, Beta, G, h0, scale, Q_norm, K_norm = prepare_inputs(
-        batch_size, seq_len, num_heads, head_dim, device, dtype
-    )
+    if use_gate_in_kernel:
+        Q, K, V, Beta, G_raw, G_activated, h0, scale, Q_norm, K_norm, A_log, dt_bias = prepare_inputs(
+            batch_size, seq_len, num_heads, head_dim, device, dtype,
+            use_gate_in_kernel=True, safe_gate=safe_gate
+        )
+        lower_bound = -5.0 if safe_gate else None
+    else:
+        Q, K, V, Beta, G, h0, scale, Q_norm, K_norm = prepare_inputs(
+            batch_size, seq_len, num_heads, head_dim, device, dtype,
+            use_gate_in_kernel=False, safe_gate=safe_gate
+        )
+        G_raw = G
+        G_activated = G
+        A_log, dt_bias, lower_bound = None, None, None
     
-    # FLA chunk_kda (with safe_gate=True for TensorCore acceleration)
-    print(f"\n{YELLOW}Running FLA chunk_kda (safe_gate=True)...{RESET}")
-    O_fla, S_fla = chunk_kda(
-        q=Q_norm.clone(), k=K_norm.clone(), v=V.clone(), g=G.clone(),
-        beta=Beta.clone(), scale=scale, initial_state=h0.clone(), output_final_state=True,
-        use_qk_l2norm_in_kernel=False, use_gate_in_kernel=False, safe_gate=True
-    )
+    # FLA chunk_kda
+    print(f"\n{YELLOW}Running FLA chunk_kda (use_gate_in_kernel={use_gate_in_kernel}, safe_gate={safe_gate})...{RESET}")
+    if use_gate_in_kernel:
+        O_fla, S_fla = chunk_kda(
+            q=Q_norm.clone(), k=K_norm.clone(), v=V.clone(), g=G_raw.clone(),
+            beta=Beta.clone(), scale=scale, initial_state=h0.clone(), output_final_state=True,
+            use_qk_l2norm_in_kernel=False, use_gate_in_kernel=True,
+            A_log=A_log, dt_bias=dt_bias, safe_gate=safe_gate, lower_bound=lower_bound
+        )
+    else:
+        O_fla, S_fla = chunk_kda(
+            q=Q_norm.clone(), k=K_norm.clone(), v=V.clone(), g=G_activated.clone(),
+            beta=Beta.clone(), scale=scale, initial_state=h0.clone(), output_final_state=True,
+            use_qk_l2norm_in_kernel=False, use_gate_in_kernel=False, safe_gate=safe_gate
+        )
     
     # KDA Optimized (use pre-normalized Q, K to match FLA)
     print(f"{YELLOW}Running KDA Optimized...{RESET}")
-    O_opt, S_opt = kda_forward(
-        q=Q_norm.clone(), k=K_norm.clone(), v=V.clone(), g=G.clone(),
-        beta=Beta.clone(), scale=scale, initial_state=h0.clone(),
-        output_final_state=True, chunk_size=chunk_size, normalize_qk=False
-    )
+    if use_gate_in_kernel:
+        O_opt, S_opt = kda_forward(
+            q=Q_norm.clone(), k=K_norm.clone(), v=V.clone(), g=G_raw.clone(),
+            beta=Beta.clone(), scale=scale, initial_state=h0.clone(),
+            output_final_state=True, chunk_size=chunk_size, normalize_qk=False,
+            use_gate_in_kernel=True, A_log=A_log, dt_bias=dt_bias,
+            safe_gate=safe_gate, lower_bound=lower_bound
+        )
+    else:
+        O_opt, S_opt = kda_forward(
+            q=Q_norm.clone(), k=K_norm.clone(), v=V.clone(), g=G_activated.clone(),
+            beta=Beta.clone(), scale=scale, initial_state=h0.clone(),
+            output_final_state=True, chunk_size=chunk_size, normalize_qk=False
+        )
     
     # Compare
     print(f"\n{BOLD}Results:{RESET}")
@@ -152,25 +272,51 @@ def test_vs_fla(batch_size=1, seq_len=128, num_heads=2, head_dim=128, chunk_size
 
 
 def benchmark(batch_size=1, seq_len=8192, num_heads=96, head_dim=128, 
-              chunk_size=64, num_warmup=10, num_iters=100):
+              chunk_size=64, num_warmup=10, num_iters=100,
+              use_gate_in_kernel=False, safe_gate=False):
     """Benchmark KDA Optimized vs FLA chunk_kda."""
     device, dtype = "cuda", torch.bfloat16
     
-    print(f"{BOLD}{CYAN}Benchmark: KDA Optimized vs FLA{RESET}")
+    mode_str = ""
+    if use_gate_in_kernel:
+        mode_str = " (use_gate_in_kernel=True"
+        if safe_gate:
+            mode_str += ", safe_gate=True)"
+        else:
+            mode_str += ")"
+    
+    print(f"{BOLD}{CYAN}Benchmark: KDA Optimized vs FLA{mode_str}{RESET}")
     print(f"B={batch_size}, T={seq_len}, H={num_heads}, d={head_dim}, chunk_size={chunk_size}")
     print(f"Warmup: {num_warmup}, Iterations: {num_iters}")
     print("-" * 60)
     
-    Q, K, V, Beta, G, h0, scale, Q_norm, K_norm = prepare_inputs(
-        batch_size, seq_len, num_heads, head_dim, device, dtype
-    )
+    if use_gate_in_kernel:
+        Q, K, V, Beta, G_raw, G_activated, h0, scale, Q_norm, K_norm, A_log, dt_bias = prepare_inputs(
+            batch_size, seq_len, num_heads, head_dim, device, dtype,
+            use_gate_in_kernel=True, safe_gate=safe_gate
+        )
+        lower_bound = -5.0 if safe_gate else None
+    else:
+        Q, K, V, Beta, G, h0, scale, Q_norm, K_norm = prepare_inputs(
+            batch_size, seq_len, num_heads, head_dim, device, dtype,
+            use_gate_in_kernel=False, safe_gate=safe_gate
+        )
+        G_raw = G
+        G_activated = G
+        A_log, dt_bias, lower_bound = None, None, None
     
-    # FLA Benchmark (with safe_gate=True for TensorCore acceleration)
-    print(f"\n{YELLOW}Benchmarking FLA chunk_kda (safe_gate=True)...{RESET}")
+    # FLA Benchmark
+    print(f"\n{YELLOW}Benchmarking FLA chunk_kda...{RESET}")
     for _ in range(num_warmup):
-        O_fla, _ = chunk_kda(q=Q_norm, k=K_norm, v=V, g=G, beta=Beta, scale=scale, 
-                            initial_state=h0.clone(), output_final_state=True,
-                            use_qk_l2norm_in_kernel=False, use_gate_in_kernel=False, safe_gate=True)
+        if use_gate_in_kernel:
+            O_fla, _ = chunk_kda(q=Q_norm, k=K_norm, v=V, g=G_raw, beta=Beta, scale=scale, 
+                                initial_state=h0.clone(), output_final_state=True,
+                                use_qk_l2norm_in_kernel=False, use_gate_in_kernel=True,
+                                A_log=A_log, dt_bias=dt_bias, safe_gate=safe_gate, lower_bound=lower_bound)
+        else:
+            O_fla, _ = chunk_kda(q=Q_norm, k=K_norm, v=V, g=G_activated, beta=Beta, scale=scale, 
+                                initial_state=h0.clone(), output_final_state=True,
+                                use_qk_l2norm_in_kernel=False, use_gate_in_kernel=False, safe_gate=safe_gate)
     torch.cuda.synchronize()
     
     start = torch.cuda.Event(enable_timing=True)
@@ -178,9 +324,15 @@ def benchmark(batch_size=1, seq_len=8192, num_heads=96, head_dim=128,
     
     start.record()
     for _ in range(num_iters):
-        O_fla, _ = chunk_kda(q=Q_norm, k=K_norm, v=V, g=G, beta=Beta, scale=scale,
-                            initial_state=h0.clone(), output_final_state=True,
-                            use_qk_l2norm_in_kernel=False, use_gate_in_kernel=False, safe_gate=True)
+        if use_gate_in_kernel:
+            O_fla, _ = chunk_kda(q=Q_norm, k=K_norm, v=V, g=G_raw, beta=Beta, scale=scale,
+                                initial_state=h0.clone(), output_final_state=True,
+                                use_qk_l2norm_in_kernel=False, use_gate_in_kernel=True,
+                                A_log=A_log, dt_bias=dt_bias, safe_gate=safe_gate, lower_bound=lower_bound)
+        else:
+            O_fla, _ = chunk_kda(q=Q_norm, k=K_norm, v=V, g=G_activated, beta=Beta, scale=scale,
+                                initial_state=h0.clone(), output_final_state=True,
+                                use_qk_l2norm_in_kernel=False, use_gate_in_kernel=False, safe_gate=safe_gate)
     end.record()
     torch.cuda.synchronize()
     fla_ms = start.elapsed_time(end) / num_iters
@@ -189,16 +341,30 @@ def benchmark(batch_size=1, seq_len=8192, num_heads=96, head_dim=128,
     # KDA Optimized Benchmark
     print(f"\n{YELLOW}Benchmarking KDA Optimized...{RESET}")
     for _ in range(num_warmup):
-        O_opt, _ = kda_forward(q=Q_norm, k=K_norm, v=V, g=G, beta=Beta, scale=scale,
-                              initial_state=h0.clone(), output_final_state=True, 
-                              chunk_size=chunk_size, normalize_qk=False)
+        if use_gate_in_kernel:
+            O_opt, _ = kda_forward(q=Q_norm, k=K_norm, v=V, g=G_raw, beta=Beta, scale=scale,
+                                  initial_state=h0.clone(), output_final_state=True, 
+                                  chunk_size=chunk_size, normalize_qk=False,
+                                  use_gate_in_kernel=True, A_log=A_log, dt_bias=dt_bias,
+                                  safe_gate=safe_gate, lower_bound=lower_bound)
+        else:
+            O_opt, _ = kda_forward(q=Q_norm, k=K_norm, v=V, g=G_activated, beta=Beta, scale=scale,
+                                  initial_state=h0.clone(), output_final_state=True, 
+                                  chunk_size=chunk_size, normalize_qk=False)
     torch.cuda.synchronize()
     
     start.record()
     for _ in range(num_iters):
-        O_opt, _ = kda_forward(q=Q_norm, k=K_norm, v=V, g=G, beta=Beta, scale=scale,
-                              initial_state=h0.clone(), output_final_state=True,
-                              chunk_size=chunk_size, normalize_qk=False)
+        if use_gate_in_kernel:
+            O_opt, _ = kda_forward(q=Q_norm, k=K_norm, v=V, g=G_raw, beta=Beta, scale=scale,
+                                  initial_state=h0.clone(), output_final_state=True,
+                                  chunk_size=chunk_size, normalize_qk=False,
+                                  use_gate_in_kernel=True, A_log=A_log, dt_bias=dt_bias,
+                                  safe_gate=safe_gate, lower_bound=lower_bound)
+        else:
+            O_opt, _ = kda_forward(q=Q_norm, k=K_norm, v=V, g=G_activated, beta=Beta, scale=scale,
+                                  initial_state=h0.clone(), output_final_state=True,
+                                  chunk_size=chunk_size, normalize_qk=False)
     end.record()
     torch.cuda.synchronize()
     opt_ms = start.elapsed_time(end) / num_iters
@@ -226,31 +392,53 @@ if __name__ == "__main__":
     parser.add_argument("--num-heads", type=int, default=96)
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--chunk-size", type=int, default=64)
+    # Arguments for gate activation fusion (default: enabled)
+    parser.add_argument("--no-gate-in-kernel", action="store_true",
+                       help="Disable fused gate activation (use pre-activated g)")
+    parser.add_argument("--no-safe-gate", action="store_true",
+                       help="Disable safe_gate mode (use softplus instead of sigmoid)")
     
     args = parser.parse_args()
     
-    print(f"{BOLD}KDA Optimized Test Suite{RESET}\n")
+    # Default: use_gate_in_kernel=True, safe_gate=True
+    use_gate_in_kernel = not args.no_gate_in_kernel
+    safe_gate = not args.no_safe_gate
+    
+    mode_str = ""
+    if use_gate_in_kernel:
+        mode_str = f" [use_gate_in_kernel=True"
+        if safe_gate:
+            mode_str += ", safe_gate=True]"
+        else:
+            mode_str += "]"
+    else:
+        mode_str = " [use_gate_in_kernel=False]"
+    
+    print(f"{BOLD}KDA Optimized Test Suite{mode_str}{RESET}\n")
     
     results = []
     
     if args.test in ("naive", "all"):
         print("=" * 70)
         results.append(("vs Naive", test_vs_naive(
-            args.batch_size, args.seq_len, args.num_heads, args.head_dim, args.chunk_size
+            args.batch_size, args.seq_len, args.num_heads, args.head_dim, args.chunk_size,
+            use_gate_in_kernel=use_gate_in_kernel, safe_gate=safe_gate
         )))
         print()
     
     if args.test in ("fla", "all"):
         print("=" * 70)
         results.append(("vs FLA", test_vs_fla(
-            args.batch_size, args.seq_len, args.num_heads, args.head_dim, args.chunk_size
+            args.batch_size, args.seq_len, args.num_heads, args.head_dim, args.chunk_size,
+            use_gate_in_kernel=use_gate_in_kernel, safe_gate=safe_gate
         )))
         print()
     
     if args.test in ("benchmark", "all"):
         print("=" * 70)
         benchmark(args.batch_size, args.seq_len, args.num_heads, 
-                 args.head_dim, args.chunk_size)
+                 args.head_dim, args.chunk_size,
+                 use_gate_in_kernel=use_gate_in_kernel, safe_gate=safe_gate)
         results.append(("Benchmark", True))
         print()
     
